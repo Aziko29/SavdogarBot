@@ -1,0 +1,24 @@
+# Render Blueprint (optional). You can also create the service by hand in the dashboard.
+services:
+  - type: web
+    name: savdogar-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOSH_ADMIN_ID
+        sync: false
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: GEMINI_MODELS
+        sync: false
+      - key: DATABASE_URL  # PostgreSQL connection string (Supabase / Neon); see README section 8
+        sync: false
+      - key: TZ
+        value: Asia/Tashkent
