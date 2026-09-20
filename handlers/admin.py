@@ -30,7 +30,7 @@ from config import settings
 from db.admins import is_head_admin
 from db.engine import engine
 from db.schema import orders_t, post_log_t
-from db.settings import get_settings, update_settings
+from db.settings import MULTI_MAX, MULTI_MIN, get_settings, update_settings
 from handlers.filters import AdminFilter
 from scheduler import apply_interval, is_night, post_next
 from utils import local_now
@@ -64,6 +64,7 @@ _FIELD_STEPS: dict[str, int] = {
     "new_keep": 5,
     "mid_keep": 5,
 }
+_MULTI_KEYS = frozenset({"new_multi", "mid_multi", "old_multi"})
 _FIELD_LABELS: dict[str, str] = {
     "new_multi": "\U0001f195 Yangi \u00d7",
     "mid_multi": "\U0001f552 O'rta \u00d7",
@@ -189,7 +190,7 @@ def _settings_text(s: BotSettings) -> str:
     policy = _POLICY_LABELS.get(s.repost_policy, s.repost_policy)
     return (
         "\u2699\ufe0f <b>Sozlamalar</b>\n\n"
-        "<b>Post tanlash og'irligi:</b>\n"
+        f"<b>Post tanlash og'irligi ({MULTI_MIN}\u00d7\u2013{MULTI_MAX}\u00d7):</b>\n"
         f"\U0001f195 Yangi: <b>{s.new_multi}</b> \u00b7 \U0001f552 O'rta: <b>{s.mid_multi}</b> "
         f"\u00b7 \U0001f4e6 Eski: <b>{s.old_multi}</b>\n"
         f"\U0001f522 Toifada qoldirish: yangi <b>{s.new_keep}</b> ta \u00b7 o'rta <b>{s.mid_keep}</b> ta\n\n"
@@ -349,7 +350,14 @@ async def on_adjust(callback: CallbackQuery, callback_data: SetCB) -> None:
         await callback.answer(_BAD_VALUE_TEXT, show_alert=True)
         return
     current = await get_settings()
-    new_value = int(getattr(current, callback_data.field)) + callback_data.sign * step
+    current_value = int(getattr(current, callback_data.field))
+    new_value = current_value + callback_data.sign * step
+    if callback_data.field in _MULTI_KEYS:
+        # A weight stays within MULTI_MIN..MULTI_MAX; a stored value outside it is pulled back in.
+        new_value = max(MULTI_MIN, min(MULTI_MAX, new_value))
+        if new_value == current_value:
+            await callback.answer(f"Chegara: {MULTI_MIN}\u00d7 \u2013 {MULTI_MAX}\u00d7")
+            return
     try:
         await update_settings(**{callback_data.field: new_value})
     except ValueError as exc:

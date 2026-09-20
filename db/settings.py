@@ -16,6 +16,8 @@ from db.schema import settings_t
 logger = logging.getLogger("db.settings")
 
 _MULTI_FIELDS = ("new_multi", "mid_multi", "old_multi")
+MULTI_MIN = 1  # selection weight of a category: 1x ...
+MULTI_MAX = 5  # ... to 5x
 _KEEP_FIELDS = ("new_keep", "mid_keep")
 _TIME_FIELDS = ("night_start", "night_end")
 _ALLOWED = frozenset(
@@ -58,7 +60,7 @@ def _validate(fields: dict[str, Any]) -> dict[str, Any]:
     clean: dict[str, Any] = {}
     for name, value in fields.items():
         if name in _MULTI_FIELDS:
-            clean[name] = _as_int(name, value, 0, 100)
+            clean[name] = _as_int(name, value, MULTI_MIN, MULTI_MAX)
         elif name == "interval_mins":
             clean[name] = _as_int(name, value, 1, 1440)
         elif name in _KEEP_FIELDS:
