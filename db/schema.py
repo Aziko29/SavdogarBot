@@ -210,6 +210,33 @@ chat_relay_t = Table(
     sqlite_autoincrement=True,
 )
 
+# Customer inquiries: a live chat with the admins that is NOT tied to an order (the customer tapped
+# "contact the admin" under a product). One row per customer; `is_open` + `updated_at` decide
+# whether his messages are still relayed.
+inquiries_t = Table(
+    "inquiries",
+    metadata,
+    Column("user_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("product_id", Integer, nullable=True),
+    Column("user_fullname", Text, nullable=False, server_default=""),
+    Column("is_open", Boolean, nullable=False, server_default=false()),
+    Column("updated_at", UTCDateTime, nullable=False, default=_utcnow, onupdate=_utcnow),
+)
+
+# Which message in which admin's chat belongs to which customer's inquiry (so a reply reaches him).
+inquiry_relay_t = Table(
+    "inquiry_relay",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", BigInteger, nullable=False),
+    Column("admin_id", BigInteger, nullable=False),
+    Column("message_id", BigInteger, nullable=False),
+    Column("created_at", UTCDateTime, nullable=False, default=_utcnow),
+    UniqueConstraint("admin_id", "message_id", name="uq_inquiry_admin_message"),
+    Index("ix_inquiry_relay_user_id", "user_id"),
+    sqlite_autoincrement=True,
+)
+
 api_key_state_t = Table(
     "api_key_state",
     metadata,

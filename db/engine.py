@@ -19,7 +19,16 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sqlalchemy.pool import StaticPool
 
 from config import BASE_DIR, settings
-from db.schema import admins_t, chats_t, metadata, pending_chats_t, schema_version_t, settings_t
+from db.schema import (
+    admins_t,
+    chats_t,
+    inquiries_t,
+    inquiry_relay_t,
+    metadata,
+    pending_chats_t,
+    schema_version_t,
+    settings_t,
+)
 
 logger = logging.getLogger("db.engine")
 
@@ -125,6 +134,12 @@ def _create_pending_chats_table(conn: Connection) -> None:
     pending_chats_t.create(bind=conn, checkfirst=True)
 
 
+def _create_inquiry_tables(conn: Connection) -> None:
+    """Create the inquiries + inquiry_relay tables (customer <-> admin chat without an order) for older DBs."""
+    inquiries_t.create(bind=conn, checkfirst=True)
+    inquiry_relay_t.create(bind=conn, checkfirst=True)
+
+
 # Ordered (version, description, fn) entries; version 1 is the baseline created by create_all().
 # Migration fns must be idempotent (CREATE ... IF NOT EXISTS) because create_all() runs first.
 _MIGRATIONS: tuple[Migration, ...] = (
@@ -133,6 +148,7 @@ _MIGRATIONS: tuple[Migration, ...] = (
     (4, "add the chats table: source/target channels and groups managed from the bot", _create_chats_table),
     (5, "add the pending_chats table: unregistered chats the bot leaves after a grace period", _create_pending_chats_table),
     (6, "add order details (quantity, phone, address), outcome and reminder columns to orders", _add_order_details),
+    (7, "add the inquiries tables: customer <-> admin chat that is not tied to an order", _create_inquiry_tables),
 )
 
 BASELINE_VERSION = 1

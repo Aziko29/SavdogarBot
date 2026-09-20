@@ -1,4 +1,4 @@
-"""Admin product browser (list, card, actions, typed edits) and the pending / in-progress order lists."""
+"""Admin product browser (list, card, actions, typed edits) and the orders menu (pending / in-progress / finished lists, clean-up)."""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +23,16 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from caption import build_caption, parse_ai_json, product_caption_fields, strip_html
 from db.models import CATEGORIES
-from db.orders import list_in_progress, list_pending, record_relay_message, set_admin_msgs
+from db.orders import (
+    count_finished,
+    count_order_groups,
+    list_finished,
+    list_in_progress,
+    list_pending,
+    purge_finished_orders,
+    record_relay_message,
+    set_admin_msgs,
+)
 from db.posts import live_posts
 from db.products import (
     get_product,
@@ -34,7 +43,7 @@ from db.products import (
     update_fields,
 )
 from handlers.admin import ORDERS_CALLBACK, PRODUCTS_CALLBACK, MenuCB, _db_guard, _edit, _fmt_dt
-from handlers.client import _build_admin_text, order_markup
+from handlers.client import _build_admin_text, _order_state_line, order_markup
 from handlers.filters import AdminFilter
 from poster import PublishError, mark_available, mark_sold, publish_product
 from repolish import RepolishOutcome, repolish_after_edit
@@ -716,14 +725,33 @@ async def on_live_skip(callback: CallbackQuery, callback_data: ActCB) -> None:
     await callback.answer()
 
 
-# ---------------------------------------------------------------- order lists
+# ---------------------------------------------------------------- orders menu
 
+PENDING_CALLBACK = "ord:pend"
 IN_PROGRESS_CALLBACK = "ord:prog"
+FINISHED_CALLBACK = "ord:done"
+CLEAN_CALLBACK = "ord:clean"
+
+_CLEAN_OLD_DAYS = 7  # the "older than" clean-up option
+_FINISHED_LIST_LIMIT = 20
+_DELETE_PAUSE_SEC = 0.05  # gentle pacing while deleting chat messages (Telegram flood limits)
+
+
+class ClearCB(CallbackData, prefix="ocl"):
+    """Clean-up of finished orders: ask for confirmation, then delete."""
+
+    step: str  # "ask" | "go"
+    days: int = 0  # 0 = every finished order, N = only those untouched for more than N days
+
+
+def _orders_back_row() -> list[InlineKeyboardButton]:
+    """Button row that returns to the orders menu."""
+    return [_btn("\u2b05\ufe0f Buyurtmalar", ORDERS_CALLBACK)]
 
 
 def _orders_nav(other_label: str, other_callback: str) -> InlineKeyboardMarkup:
-    """Keyboard under an order-list header: switch to the other list, or go back to the menu."""
-    return InlineKeyboardMarkup(inline_keyboard=[[_btn(other_label, other_callback)], _menu_row()])
+    """Keyboard under an order-list header: switch to the other list, or go back to the orders menu."""
+    return InlineKeyboardMarkup(inline_keyboard=[[_btn(other_label, other_callback)], _orders_back_row()])
 
 
 async def _send_order_card(bot: Bot, admin_id: int, order: Order) -> None:
@@ -784,7 +812,37 @@ async def _show_orders(
 
 @router.callback_query(F.data == ORDERS_CALLBACK)
 @_db_guard
-async def on_orders(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+async def on_orders_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    """The orders menu: counts and one button per list, plus the clean-up."""
+    await state.clear()
+    pending, in_progress, finished = await count_order_groups()
+    text = (
+        "\U0001f9fe <b>Buyurtmalar</b>\n\n"
+        f"\u23f3 Kutilayotgan: <b>{pending}</b>\n"
+        f"\U0001f69a Jarayonda: <b>{in_progress}</b>\n"
+        f"\U0001f4c1 Yakunlangan: <b>{finished}</b>\n\n"
+        "Bo'limni tanlang."
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _btn(f"\u23f3 Kutilayotgan ({pending})", PENDING_CALLBACK),
+                _btn(f"\U0001f69a Jarayonda ({in_progress})", IN_PROGRESS_CALLBACK),
+            ],
+            [
+                _btn(f"\U0001f4c1 Yakunlangan ({finished})", FINISHED_CALLBACK),
+                _btn("\U0001f9f9 Tozalash", CLEAN_CALLBACK),
+            ],
+            _menu_row(),
+        ]
+    )
+    await _edit(callback, text, markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data == PENDING_CALLBACK)
+@_db_guard
+async def on_orders_pending(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """List pending orders as cards with accept/reject buttons."""
     await state.clear()
     await _show_orders(
@@ -808,5 +866,123 @@ async def on_orders_in_progress(callback: CallbackQuery, state: FSMContext, bot:
         await list_in_progress(_MAX_ORDERS),
         "\U0001f69a <b>Jarayondagi buyurtmalar:</b>",
         "\U0001f69a Jarayondagi buyurtma yo'q.",
-        _orders_nav("\u23f3 Kutilayotgan buyurtmalar", ORDERS_CALLBACK),
+        _orders_nav("\u23f3 Kutilayotgan buyurtmalar", PENDING_CALLBACK),
     )
+
+
+@router.callback_query(F.data == FINISHED_CALLBACK)
+@_db_guard
+async def on_orders_finished(callback: CallbackQuery, state: FSMContext) -> None:
+    """Compact text list of the latest finished orders (no cards, so the chat stays clean)."""
+    await state.clear()
+    orders = await list_finished(_FINISHED_LIST_LIMIT)
+    if not orders:
+        await _edit(
+            callback,
+            "\U0001f4c1 Yakunlangan buyurtma yo'q.",
+            InlineKeyboardMarkup(inline_keyboard=[_orders_back_row()]),
+        )
+        await callback.answer()
+        return
+    lines = [f"\U0001f4c1 <b>Yakunlangan buyurtmalar</b> (oxirgi {len(orders)} ta)", ""]
+    for order in orders:
+        product = await get_product(order.product_id)
+        name = html.escape(product.name) if product is not None else f"id={order.product_id}"
+        state_line = _order_state_line(order) or ""
+        lines.append(
+            f"#{order.order_id} \u00b7 {name} \u00d7 {order.quantity} \u2014 {state_line} \u00b7 {_fmt_dt(order.updated_at)}"
+        )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[_btn("\U0001f9f9 Tozalash", CLEAN_CALLBACK)], _orders_back_row()]
+    )
+    await _edit(callback, "\n".join(lines), markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data == CLEAN_CALLBACK)
+@_db_guard
+async def on_orders_clean_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    """Clean-up menu: what can be removed and the two options."""
+    await state.clear()
+    total = await count_finished()
+    if total == 0:
+        await _edit(
+            callback,
+            "\U0001f9f9 <b>Tozalash</b>\n\nO'chiriladigan yakunlangan buyurtma yo'q.",
+            InlineKeyboardMarkup(inline_keyboard=[_orders_back_row()]),
+        )
+        await callback.answer()
+        return
+    old = await count_finished(_CLEAN_OLD_DAYS)
+    text = (
+        "\U0001f9f9 <b>Tozalash</b>\n\n"
+        "Faqat yakunlangan buyurtmalar (bajarilgan, bekor qilingan, rad etilgan) o'chiriladi \u2014 "
+        "ularning chatdagi xabarlari ham. Kutilayotgan va jarayondagi buyurtmalarga tegilmaydi.\n\n"
+        f"\U0001f4c1 Jami yakunlangan: <b>{total}</b>\n"
+        f"\U0001f5d3 {_CLEAN_OLD_DAYS} kundan eskilari: <b>{old}</b>"
+    )
+    rows: list[list[InlineKeyboardButton]] = []
+    if old:
+        rows.append([_btn(
+            f"\U0001f9f9 {_CLEAN_OLD_DAYS} kundan eskilari ({old})",
+            ClearCB(step="ask", days=_CLEAN_OLD_DAYS).pack(),
+        )])
+    rows.append([_btn(f"\U0001f9f9 Hammasi ({total})", ClearCB(step="ask", days=0).pack())])
+    rows.append(_orders_back_row())
+    await _edit(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+async def _delete_chat_messages(bot: Bot, refs: list[tuple[int, int]]) -> int:
+    """Delete the given (chat_id, message_id) messages, ignoring the ones Telegram will not delete; returns how many went."""
+    removed = 0
+    for chat_id, message_id in refs:
+        for _attempt in range(2):
+            try:
+                await bot.delete_message(chat_id, message_id)
+                removed += 1
+                break
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after)
+            except TelegramAPIError:
+                break  # already deleted, too old or otherwise not deletable: nothing more to do
+        await asyncio.sleep(_DELETE_PAUSE_SEC)
+    return removed
+
+
+@router.callback_query(ClearCB.filter(F.step == "ask"))
+@_db_guard
+async def on_clean_ask(callback: CallbackQuery, callback_data: ClearCB) -> None:
+    """Ask for confirmation before deleting anything."""
+    days = callback_data.days if callback_data.days > 0 else None
+    count = await count_finished(days)
+    if count == 0:
+        await callback.answer("O'chiriladigan buyurtma yo'q.", show_alert=True)
+        return
+    scope = f"{callback_data.days} kundan eski " if days else ""
+    text = (
+        f"\u26a0\ufe0f <b>{count}</b> ta {scope}yakunlangan buyurtma o'chiriladi.\n"
+        "Bu amalni qaytarib bo'lmaydi. Davom etamizmi?"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            _btn("\u2705 Ha, o'chirish", ClearCB(step="go", days=callback_data.days).pack()),
+            _btn("\u274c Yo'q", CLEAN_CALLBACK),
+        ]]
+    )
+    await _edit(callback, text, markup)
+    await callback.answer()
+
+
+@router.callback_query(ClearCB.filter(F.step == "go"))
+@_db_guard
+async def on_clean_go(callback: CallbackQuery, callback_data: ClearCB, bot: Bot) -> None:
+    """Delete the finished orders and their messages in the admins' chats."""
+    await callback.answer("Tozalanmoqda\u2026")
+    days = callback_data.days if callback_data.days > 0 else None
+    deleted, refs = await purge_finished_orders(days)
+    # The confirmation message we are about to rewrite is not an order message, so it is never in `refs`.
+    removed = await _delete_chat_messages(bot, refs)
+    logger.info("Admin %s cleaned %s finished order(s) (%s chat message(s))", callback.from_user.id, deleted, removed)
+    text = f"\u2705 <b>Tozalandi</b>\n\nO'chirilgan buyurtmalar: <b>{deleted}</b>\nTozalangan xabarlar: <b>{removed}</b>"
+    await _edit(callback, text, InlineKeyboardMarkup(inline_keyboard=[_orders_back_row()]))

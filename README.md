@@ -43,17 +43,21 @@ Send `/admin` to the bot in a private chat for settings, product management and 
 - **AI re-polish:** when an admin edits a product field (name, price, size, fabric, stock) and saves, the value is stored at once, then the AI rewrites the sales pitch and hashtags around the corrected data and the live channel posts are edited to match the database. The AI can never change the admin's values, and a pitch that contains a number not present in the product data is rejected (the plain caption with the admin's data is used instead). If the admin makes another edit while the AI is working, the outdated result is discarded and the newer edit is polished.
 
 ## 4a. Orders
-The button under a channel post opens an order form in the bot, one step at a time (every step can be abandoned with `/cancel`, the form expires after 30 minutes of inactivity):
+The button under a channel post opens the product in the bot with two choices: **Buyurtma qilish** (order) and **Admin bilan bog'lanish** (contact the admin, see below).
+
+**Buyurtma qilish** opens an order form, one step at a time (every step can be abandoned with `/cancel`, the form expires after 30 minutes of inactivity):
 1. **Quantity** (buttons 1-5 or a typed number), 2. **phone** (the "share my number" button or typed; a 9-digit local number gets `+998`), 3. **address** (typed, a shared location, or "Olib ketaman" for pick-up), 4. optional **note** (text, voice or photo), 5. a summary with **Tasdiqlash / Bekor qilish**.
 
 Only after the customer confirms is the order created and sent to every admin as a card with the quantity, phone, address and note. The lifecycle of an order:
 - `pending` -> the admin taps **Qabul qildim** (`accepted`, the live chat with the customer opens) or **Qolmagan** (`rejected`).
 - `accepted` -> **Bajarildi** (completed) or **Bekor qilish** (cancelled). Either one closes the chat and tells the customer. The card also has **Suhbatni yakunlash** (end the chat only) and **Tugadi** (mark the product sold).
 - While an order is `pending` the customer can withdraw it: `/buyurtmalarim` lists his latest orders with their status and a cancel button; the admins' cards are updated and they get a short notice.
-- `/admin` -> **Buyurtmalar** lists the pending orders; its **Jarayondagi buyurtmalar** button lists the accepted, not yet finished ones.
+- `/admin` -> **Buyurtmalar** is a menu with the counts: **Kutilayotgan** (pending cards), **Jarayonda** (accepted, not yet finished cards), **Yakunlangan** (compact text list of the latest finished orders) and **Tozalash**.
+- **Tozalash** deletes finished orders (completed, cancelled, rejected) - all of them or only those older than 7 days - after a confirmation, together with their cards and relayed messages in the admins' chats. Pending and in-progress orders are never touched.
+- **Admin bilan bog'lanish:** the customer writes his question (text, voice, photo); every admin gets a card and each relayed message, and any admin answers by replying to it. The customer ends the chat with `/cancel`, an admin with **Suhbatni yakunlash**; an inquiry with no customer activity for 24 hours stops relaying. If the customer already has an open order chat, he simply writes there.
 - **Reminders:** a pending order that nobody decided within `ORDER_REMIND_AFTER_MIN` minutes is repeated to every admin (as a reply to the order card), then again every `ORDER_REMIND_EVERY_MIN` minutes, at most `ORDER_REMIND_MAX` times. The check runs every 2 minutes and does not depend on the night window.
 
-Existing databases are upgraded automatically at startup (schema v6 adds the new order columns); old orders show quantity 1 and no phone/address.
+Existing databases are upgraded automatically at startup (schema v6 adds the new order columns, v7 the inquiry tables); old orders show quantity 1 and no phone/address.
 
 ## 5. Tests
 ```bash

@@ -5,7 +5,7 @@ import logging
 from collections.abc import Mapping
 from datetime import timedelta
 
-from sqlalchemy import exists, insert, or_, select, update
+from sqlalchemy import and_, delete, exists, func, insert, or_, select, update
 
 from db.engine import dialect_insert, engine, logged_db
 from db.models import ORDER_OUTCOMES, ORDER_STATUSES, Order, dump_admin_msg_ids, order_from_row
@@ -16,6 +16,14 @@ logger = logging.getLogger("db.orders")
 
 _DECISIONS = tuple(s for s in ORDER_STATUSES if s != "pending")
 _FINAL_OUTCOMES = tuple(o for o in ORDER_OUTCOMES if o)
+
+# An order is "finished" once nothing more can happen to it: the seller declined it (or the customer
+# withdrew it), or an accepted order was closed as completed / cancelled.
+_FINISHED = or_(
+    orders_t.c.status == "rejected",
+    and_(orders_t.c.status == "accepted", orders_t.c.outcome != ""),
+)
+_DELETE_CHUNK = 500  # keeps the number of bound parameters far below every database's limit
 
 
 @logged_db
@@ -290,3 +298,77 @@ async def mark_reminded(order_id: int) -> None:
             .where(orders_t.c.order_id == order_id, orders_t.c.status == "pending")
             .values(remind_count=orders_t.c.remind_count + 1, reminded_at=utcnow())
         )
+
+
+@logged_db
+async def count_order_groups() -> tuple[int, int, int]:
+    """Return (pending, in progress, finished) order counts for the admin orders menu."""
+
+    async def count(*conditions: object) -> int:
+        async with engine.connect() as conn:
+            value = (await conn.execute(select(func.count()).select_from(orders_t).where(*conditions))).scalar()
+        return int(value or 0)
+
+    pending = await count(orders_t.c.status == "pending")
+    in_progress = await count(orders_t.c.status == "accepted", orders_t.c.outcome == "")
+    finished = await count(_FINISHED)
+    return pending, in_progress, finished
+
+
+@logged_db
+async def list_finished(limit: int = 20) -> list[Order]:
+    """Return finished orders (declined, withdrawn, completed, cancelled), newest first."""
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(orders_t)
+            .where(_FINISHED)
+            .order_by(orders_t.c.updated_at.desc(), orders_t.c.order_id.desc())
+            .limit(limit)
+        )
+        return [order_from_row(r) for r in rows]
+
+
+@logged_db
+async def count_finished(older_than_days: int | None = None) -> int:
+    """How many finished orders a clean-up would remove (optionally only those untouched for N days)."""
+    stmt = select(func.count()).select_from(orders_t).where(_FINISHED)
+    if older_than_days is not None:
+        stmt = stmt.where(orders_t.c.updated_at < utcnow() - timedelta(days=older_than_days))
+    async with engine.connect() as conn:
+        return int((await conn.execute(stmt)).scalar() or 0)
+
+
+@logged_db
+async def purge_finished_orders(older_than_days: int | None = None) -> tuple[int, list[tuple[int, int]]]:
+    """Delete finished orders (optionally only those untouched for N days); pending and in-progress orders are never touched.
+
+    Returns (number of deleted orders, [(admin_id, message_id), ...]) where the pairs are every
+    message the bot put into the admins' chats for those orders (order cards and relayed customer
+    messages), so the caller can delete them from the chats too. All in one transaction.
+    """
+    if older_than_days is not None and older_than_days < 0:
+        raise ValueError("older_than_days must be >= 0")
+    select_stmt = select(orders_t).where(_FINISHED)
+    if older_than_days is not None:
+        select_stmt = select_stmt.where(orders_t.c.updated_at < utcnow() - timedelta(days=older_than_days))
+
+    messages: set[tuple[int, int]] = set()
+    async with engine.begin() as conn:
+        orders = [order_from_row(r) for r in await conn.execute(select_stmt)]
+        ids = [o.order_id for o in orders]
+        for order in orders:
+            messages.update((admin_id, msg_id) for admin_id, msg_id in order.admin_msg_ids.items())
+        deleted = 0
+        for start in range(0, len(ids), _DELETE_CHUNK):
+            chunk = ids[start : start + _DELETE_CHUNK]
+            relay_rows = await conn.execute(
+                select(chat_relay_t.c.admin_id, chat_relay_t.c.message_id).where(chat_relay_t.c.order_id.in_(chunk))
+            )
+            messages.update((int(r.admin_id), int(r.message_id)) for r in relay_rows)
+            await conn.execute(delete(chat_relay_t).where(chat_relay_t.c.order_id.in_(chunk)))
+            # The status check is repeated so an order that changed meanwhile can never be deleted.
+            result = await conn.execute(delete(orders_t).where(orders_t.c.order_id.in_(chunk), _FINISHED))
+            deleted += int(result.rowcount or 0)
+    return deleted, sorted(messages)

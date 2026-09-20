@@ -41,6 +41,14 @@ from db.orders import (
     set_admin_msgs,
     set_chat_open,
 )
+from db.inquiries import (
+    close_inquiry_if_open,
+    find_inquiry_user_by_relay,
+    get_open_inquiry,
+    open_inquiry,
+    record_inquiry_relay,
+    touch_inquiry,
+)
 from db.products import get_product
 from handlers.filters import AdminFilter, NotAdminFilter
 from poster import mark_sold
@@ -140,6 +148,23 @@ _CANNOT_CANCEL_TEXT = "Bu buyurtmani endi bekor qilib bo'lmaydi: sotuvchi uni al
 _CANCELLED_BY_USER_TEXT = "Buyurtma bekor qilindi."
 _USER_CANCELLED_ADMIN_TEXT = "\U0001f6ab Mijoz buyurtma #{order_id} ni bekor qildi."
 _STALE_BUTTON_TEXT = "Bu so'rov allaqachon yakunlangan yoki vaqti o'tgan."
+_ORDER_BUTTON_TEXT = "\U0001f6d2 Buyurtma qilish"
+_ASK_BUTTON_TEXT = "\U0001f4ac Admin bilan bog'lanish"
+_INQUIRY_OPENED_TEXT = (
+    "\U0001f4ac Savolingizni yozing (matn, ovozli xabar yoki rasm) \u2014 sotuvchiga yetkazaman va u shu yerda javob beradi.\n"
+    "Suhbatni tugatish uchun /cancel yozing."
+)
+_INQUIRY_HAS_ORDER_CHAT_TEXT = (
+    "Buyurtmangiz #{order_id} bo'yicha suhbat ochiq \u2014 savolingizni shu yerga yozing, sotuvchi javob beradi."
+)
+_INQUIRY_CLOSED_USER_TEXT = (
+    "Suhbat sotuvchi tomonidan yakunlandi. Yangi savolingiz bo'lsa, mahsulot havolasini qayta bosing."
+)
+_INQUIRY_ENDED_BY_USER_TEXT = "Suhbat yakunlandi."
+_NOTHING_TO_CANCEL_TEXT = "Bekor qilinadigan narsa yo'q."
+_INQUIRY_CLOSED_BY_USER_ADMIN_TEXT = "\U0001f512 Mijoz suhbatni yakunladi."
+_INQUIRY_HEADER = "\U0001f4ac <b>Savol</b> \u2014 {name} dan xabar:"
+_INQUIRY_CARD_HINT = "Javob berish uchun shu xabarga (yoki mijozning keyingi xabariga) reply qiling."
 _PLAIN_START_TEXT = (
     "Assalomu alaykum! Buyurtma berish yoki mahsulot haqida savol berish uchun "
     "kanaldagi mahsulot ostidagi havolani bosing.\n"
@@ -167,6 +192,19 @@ class ConfirmCB(CallbackData, prefix="ocnf"):
     """Customer confirmed or cancelled the order summary."""
 
     action: str  # "yes" | "no"
+
+
+class ProductActionCB(CallbackData, prefix="pact"):
+    """Customer's choice under a product opened from the channel: order it or ask the admin."""
+
+    action: str  # "order" | "ask"
+    product_id: int
+
+
+class InquiryCloseCB(CallbackData, prefix="inqcl"):
+    """Admin tapped 'end chat' on a customer inquiry (a chat that is not tied to an order)."""
+
+    user_id: int
 
 
 class OrderDecisionCB(CallbackData, prefix="odec"):
@@ -384,9 +422,32 @@ async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_al
 
 
 
+def _product_actions_markup(product_id: int) -> InlineKeyboardMarkup:
+    """The two choices under a product: order it, or contact the admin."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=_ORDER_BUTTON_TEXT,
+                    callback_data=ProductActionCB(action="order", product_id=product_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=_ASK_BUTTON_TEXT,
+                    callback_data=ProductActionCB(action="ask", product_id=product_id).pack(),
+                )
+            ],
+        ]
+    )
+
+
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_deeplink(message: Message, command: CommandObject, state: FSMContext) -> None:
-    """Entry point from a product's 'buy / ask' button: `/start prod_<id>` opens the order form."""
+    """Entry point from a product's button: `/start prod_<id>` shows the product with two choices.
+
+    The customer picks "order" (the order form starts) or "contact the admin" (an inquiry chat opens).
+    """
     user = message.from_user
     if user is None or not _allow_start(user.id):
         return
@@ -401,10 +462,88 @@ async def cmd_start_deeplink(message: Message, command: CommandObject, state: FS
         await message.answer(_NOT_AVAILABLE_TEXT)
         return
 
+    await state.clear()  # a fresh product link abandons any half-filled order form
+    await message.answer_photo(
+        product.tg_file_id,
+        caption=product.caption_html,
+        parse_mode="HTML",
+        reply_markup=_product_actions_markup(product_id),
+    )
+
+
+@router.callback_query(ProductActionCB.filter(F.action == "order"))
+async def on_product_order(
+    callback: CallbackQuery, callback_data: ProductActionCB, state: FSMContext
+) -> None:
+    """The customer chose "order": start the order form (quantity first)."""
+    message = callback.message
+    if not isinstance(message, Message):
+        await _safe_answer(callback)
+        return
+    product = await get_product(callback_data.product_id)
+    if product is None or product.status in ("sold", "removed"):
+        await _safe_answer(callback, _NOT_AVAILABLE_TEXT, show_alert=True)
+        return
+
+    await _safe_answer(callback)
     await state.set_state(OrderFlow.waiting_quantity)
-    await state.set_data({"product_id": product_id, "expires_at": time.time() + _STATE_TTL_SEC})
-    await message.answer_photo(product.tg_file_id, caption=product.caption_html, parse_mode="HTML")
+    await state.set_data({"product_id": product.id, "expires_at": time.time() + _STATE_TTL_SEC})
     await message.answer(_ASK_QUANTITY_TEXT, reply_markup=_quantity_markup())
+
+
+async def _notify_admins_inquiry(bot: Bot, user: Any, product: Product | None) -> None:
+    """Tell every admin that a customer wants to talk; each card is a reply target for the answer."""
+    customer_link = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+    lines = ["\U0001f4ac <b>Yangi savol</b>", "", f"Mijoz: {customer_link}"]
+    if user.username:
+        lines.append(f"@{user.username}")
+    if product is not None:
+        lines.append(f"Mahsulot: <b>{html.escape(product.name)}</b> (id={product.id})")
+        lines.append(f"Narxi: {html.escape(product.price)}")
+    lines.extend(["", _INQUIRY_CARD_HINT])
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user.id).pack())
+        ]]
+    )
+    for admin_id in admin_ids():
+        try:
+            sent = await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=markup)
+            await record_inquiry_relay(user.id, admin_id, sent.message_id)
+        except TelegramForbiddenError:
+            logger.warning("Admin %s has not started the bot; inquiry notice not delivered", admin_id)
+        except Exception:
+            logger.exception("Failed to notify admin %s about an inquiry of user %s", admin_id, user.id)
+
+
+@router.callback_query(ProductActionCB.filter(F.action == "ask"))
+async def on_product_ask(
+    callback: CallbackQuery, callback_data: ProductActionCB, state: FSMContext, bot: Bot
+) -> None:
+    """The customer chose "contact the admin": open an inquiry chat and tell the admins."""
+    message = callback.message
+    user = callback.from_user
+    if not isinstance(message, Message):
+        await _safe_answer(callback)
+        return
+    product = await get_product(callback_data.product_id)
+    if product is None:
+        await _safe_answer(callback, _NOT_AVAILABLE_TEXT, show_alert=True)
+        return
+
+    await _safe_answer(callback)
+    await state.clear()  # leaving an unfinished order form, if any
+
+    open_order = await get_open_order_for_user(user.id)
+    if open_order is not None:
+        # His messages already reach the admins through the order chat; a second chat would only confuse.
+        await message.answer(_INQUIRY_HAS_ORDER_CHAT_TEXT.format(order_id=open_order.order_id), reply_markup=ReplyKeyboardRemove())
+        return
+
+    await open_inquiry(user.id, product.id, user.full_name)
+    await message.answer(_INQUIRY_OPENED_TEXT, reply_markup=ReplyKeyboardRemove())
+    await _notify_admins_inquiry(bot, user, product)
 
 
 @router.message(CommandStart(deep_link=False))
@@ -497,6 +636,23 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     """Abandon whichever step of the order form the user is currently in."""
     await state.clear()
     await message.answer(_CANCELLED_TEXT, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("cancel"), StateFilter(None), NotAdminFilter())
+async def cmd_cancel_inquiry(message: Message, bot: Bot) -> None:
+    """`/cancel` outside the order form: the customer ends his inquiry chat with the admins."""
+    user = message.from_user
+    if user is None:
+        return
+    if not await close_inquiry_if_open(user.id):
+        await message.answer(_NOTHING_TO_CANCEL_TEXT)
+        return
+    await message.answer(_INQUIRY_ENDED_BY_USER_TEXT, reply_markup=ReplyKeyboardRemove())
+    for admin_id in admin_ids():
+        try:
+            await bot.send_message(admin_id, f"{_INQUIRY_CLOSED_BY_USER_ADMIN_TEXT} ({html.escape(user.full_name)})", parse_mode="HTML")
+        except Exception:
+            logger.debug("Could not tell admin %s that user %s ended the inquiry", admin_id, user.id)
 
 
 # ------------------------------------------------------------------ the order form
@@ -955,6 +1111,36 @@ async def on_chat_close(callback: CallbackQuery, callback_data: ChatCloseCB, bot
     await _safe_answer(callback, _CHAT_CLOSED_ADMIN_TEXT)
 
 
+async def _reply_to_inquiry(message: Message, bot: Bot, replied_to_id: int) -> None:
+    """An admin replied to an inquiry message: pass the answer on to that customer.
+
+    Anything that is not a relayed inquiry message (a normal admin-panel reply) is ignored.
+    """
+    admin = message.from_user
+    if admin is None:
+        return
+    user_id = await find_inquiry_user_by_relay(admin.id, replied_to_id)
+    if user_id is None:
+        return
+    # touch_inquiry() also restarts the inactivity window, so the customer can answer the reply.
+    if not await touch_inquiry(user_id):
+        await message.reply(_CHAT_ALREADY_CLOSED_TEXT)
+        return
+    try:
+        await bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+    except TelegramForbiddenError:
+        await message.reply(_RELAY_SENT_TO_ADMIN_FAIL)
+        return
+    except Exception:
+        logger.exception("Inquiry of user %s: failed to relay the admin reply", user_id)
+        await message.reply(_RELAY_SENT_TO_ADMIN_FAIL)
+        return
+    try:
+        await message.reply(_RELAY_DELIVERED_TEXT)
+    except Exception:
+        pass  # a missing confirmation shouldn't matter; the reply already reached the customer
+
+
 @router.message(StateFilter(None), F.reply_to_message, AdminFilter(), F.chat.type == "private")
 async def on_admin_chat_reply(message: Message, bot: Bot) -> None:
     """Admin replied (Telegram's native reply) to a relayed chat message; forward it to the customer.
@@ -969,7 +1155,8 @@ async def on_admin_chat_reply(message: Message, bot: Bot) -> None:
         return
     order_id = await find_order_id_by_relay(message.from_user.id, reply_to.message_id)
     if order_id is None:
-        return  # Not a chat-relay message (e.g. a normal admin-panel reply) — ignore.
+        await _reply_to_inquiry(message, bot, reply_to.message_id)  # ignores non-relay replies itself
+        return
 
     order = await get_order(order_id)
     if order is None or not order.chat_open:
@@ -994,6 +1181,55 @@ async def on_admin_chat_reply(message: Message, bot: Bot) -> None:
         pass  # A missing confirmation shouldn't matter; the reply already reached the customer.
 
 
+async def _relay_inquiry_message(message: Message, bot: Bot) -> None:
+    """Relay a customer's message to every admin when he has an open inquiry; otherwise do nothing."""
+    user = message.from_user
+    if user is None or await get_open_inquiry(user.id) is None:
+        return
+    await touch_inquiry(user.id)
+
+    header = _INQUIRY_HEADER.format(name=html.escape(user.full_name))
+    close_markup = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user.id).pack())
+        ]]
+    )
+    for admin_id in admin_ids():
+        try:
+            await bot.send_message(admin_id, header, parse_mode="HTML")
+            sent = await bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                reply_markup=close_markup,
+            )
+            await record_inquiry_relay(user.id, admin_id, sent.message_id)
+        except TelegramForbiddenError:
+            logger.warning("Inquiry of user %s: admin %s has not started the bot", user.id, admin_id)
+        except Exception:
+            logger.exception("Inquiry of user %s: failed to relay a message to admin %s", user.id, admin_id)
+
+
+@router.callback_query(InquiryCloseCB.filter(), AdminFilter())
+async def on_inquiry_close(callback: CallbackQuery, callback_data: InquiryCloseCB, bot: Bot) -> None:
+    """An admin tapped 'end chat' on an inquiry; closes it and lets the customer know."""
+    if not await close_inquiry_if_open(callback_data.user_id):
+        await _safe_answer(callback, _CHAT_ALREADY_CLOSED_TEXT, show_alert=True)
+        return
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+    try:
+        await bot.send_message(callback_data.user_id, _INQUIRY_CLOSED_USER_TEXT)
+    except TelegramForbiddenError:
+        logger.info("Inquiry of user %s: he has blocked the bot; close notice not delivered", callback_data.user_id)
+    except Exception:
+        logger.exception("Inquiry of user %s: failed to send the close notice", callback_data.user_id)
+    await _safe_answer(callback, _CHAT_CLOSED_ADMIN_TEXT)
+
+
 # NotAdminFilter is essential: this catch-all matches every private message, and the client router
 # runs before the admin routers, so without it an admin's "/admin" would be swallowed right here.
 @router.message(
@@ -1013,7 +1249,8 @@ async def on_customer_chat_message(message: Message, bot: Bot) -> None:
         return
     order = await get_open_order_for_user(user.id)
     if order is None:
-        return  # No open chat for this user — leave the message alone (e.g. spam/small talk).
+        await _relay_inquiry_message(message, bot)
+        return  # No open order chat: it was either an inquiry message or small talk to leave alone.
 
     header = _RELAY_HEADER.format(order_id=order.order_id, name=html.escape(user.full_name))
     # Every relayed customer message carries its own "end chat" button — sent only into the
