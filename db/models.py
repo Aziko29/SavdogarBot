@@ -23,6 +23,9 @@ REPOST_POLICIES: tuple[str, ...] = ("delete_previous", "keep")
 CHAT_ROLES: tuple[str, ...] = ("source", "target")
 CHAT_TYPES: tuple[str, ...] = ("channel", "group", "supergroup")
 ORDER_STATUSES: tuple[str, ...] = ("pending", "accepted", "rejected")
+# What finally happened to an order after the admin's decision ("" = still open). Kept out of
+# ORDER_STATUSES so the CHECK constraint of databases created earlier stays valid.
+ORDER_OUTCOMES: tuple[str, ...] = ("", "completed", "cancelled")
 
 
 @dataclass(slots=True)
@@ -100,6 +103,12 @@ class Order:
     updated_at: datetime
     admin_msg_ids: dict[int, int] = field(default_factory=dict)
     chat_open: bool = False
+    quantity: int = 1
+    phone: str = ""
+    address: str = ""
+    outcome: str = ""  # "" (open) | "completed" | "cancelled"
+    remind_count: int = 0
+    reminded_at: datetime | None = None
 
 
 def _mapping(row: Any) -> Mapping[str, Any]:
@@ -211,4 +220,10 @@ def order_from_row(row: Any) -> Order:
         created_at=m["created_at"],
         updated_at=m["updated_at"],
         chat_open=bool(m["chat_open"]) if "chat_open" in m else False,
+        quantity=int(m["quantity"]) if "quantity" in m and m["quantity"] else 1,
+        phone=(m["phone"] or "") if "phone" in m else "",
+        address=(m["address"] or "") if "address" in m else "",
+        outcome=(m["outcome"] or "") if "outcome" in m else "",
+        remind_count=int(m["remind_count"] or 0) if "remind_count" in m else 0,
+        reminded_at=m["reminded_at"] if "reminded_at" in m else None,
     )

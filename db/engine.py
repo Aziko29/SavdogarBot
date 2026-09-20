@@ -84,6 +84,32 @@ def _add_orders_chat_open(conn: Connection) -> None:
             raise
 
 
+# (column, SQLite type, PostgreSQL type) of the order details added with the real order flow.
+_ORDER_DETAIL_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("quantity", "INTEGER NOT NULL DEFAULT 1", "INTEGER NOT NULL DEFAULT 1"),
+    ("phone", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("address", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("outcome", "VARCHAR(16) NOT NULL DEFAULT ''", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("remind_count", "INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"),
+    ("reminded_at", "DATETIME", "TIMESTAMP"),
+)
+
+
+def _add_order_details(conn: Connection) -> None:
+    """Add quantity/phone/address/outcome/reminder columns to orders (idempotent)."""
+    postgres = conn.dialect.name == "postgresql"
+    for name, sqlite_type, pg_type in _ORDER_DETAIL_COLUMNS:
+        if postgres:
+            conn.execute(text(f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS {name} {pg_type}"))
+            continue
+        try:
+            conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {sqlite_type}"))
+        except OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status_outcome ON orders (status, outcome)"))
+
+
 def _create_admins_table(conn: Connection) -> None:
     """Create the admins table for DBs created before the admin-management feature (idempotent)."""
     admins_t.create(bind=conn, checkfirst=True)
@@ -106,6 +132,7 @@ _MIGRATIONS: tuple[Migration, ...] = (
     (3, "add the admins table for bot-managed admins", _create_admins_table),
     (4, "add the chats table: source/target channels and groups managed from the bot", _create_chats_table),
     (5, "add the pending_chats table: unregistered chats the bot leaves after a grace period", _create_pending_chats_table),
+    (6, "add order details (quantity, phone, address), outcome and reminder columns to orders", _add_order_details),
 )
 
 BASELINE_VERSION = 1

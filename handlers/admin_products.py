@@ -1,4 +1,4 @@
-"""Admin product browser (list, card, actions, typed edits) and the pending-order list."""
+"""Admin product browser (list, card, actions, typed edits) and the pending / in-progress order lists."""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +23,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from caption import build_caption, parse_ai_json, product_caption_fields, strip_html
 from db.models import CATEGORIES
-from db.orders import list_pending, set_admin_msgs
+from db.orders import list_in_progress, list_pending, record_relay_message, set_admin_msgs
 from db.posts import live_posts
 from db.products import (
     get_product,
@@ -34,7 +34,7 @@ from db.products import (
     update_fields,
 )
 from handlers.admin import ORDERS_CALLBACK, PRODUCTS_CALLBACK, MenuCB, _db_guard, _edit, _fmt_dt
-from handlers.client import OrderDecisionCB, _build_admin_text
+from handlers.client import _build_admin_text, order_markup
 from handlers.filters import AdminFilter
 from poster import PublishError, mark_available, mark_sold, publish_product
 from repolish import RepolishOutcome, repolish_after_edit
@@ -716,29 +716,23 @@ async def on_live_skip(callback: CallbackQuery, callback_data: ActCB) -> None:
     await callback.answer()
 
 
-# ---------------------------------------------------------------- pending orders
+# ---------------------------------------------------------------- order lists
+
+IN_PROGRESS_CALLBACK = "ord:prog"
+
+
+def _orders_nav(other_label: str, other_callback: str) -> InlineKeyboardMarkup:
+    """Keyboard under an order-list header: switch to the other list, or go back to the menu."""
+    return InlineKeyboardMarkup(inline_keyboard=[[_btn(other_label, other_callback)], _menu_row()])
 
 
 async def _send_order_card(bot: Bot, admin_id: int, order: Order) -> None:
-    """Send one pending order with accept/reject buttons and rebind it as this admin's live card."""
+    """Send one order card with the buttons of its current state and rebind it as this admin's live card."""
     product = await get_product(order.product_id)
     if product is None:
         logger.warning("Order %s references missing product %s", order.order_id, order.product_id)
         return
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                _btn(
-                    "\u2705 Qabul qildim",
-                    OrderDecisionCB(action="accept", order_id=order.order_id).pack(),
-                ),
-                _btn(
-                    "\u274c Qolmagan",
-                    OrderDecisionCB(action="reject", order_id=order.order_id).pack(),
-                ),
-            ]
-        ]
-    )
+    markup = order_markup(order, product)
     text = _build_admin_text(order, product)
     sent: Message | None = None
     for _attempt in range(2):
@@ -755,6 +749,9 @@ async def _send_order_card(bot: Bot, admin_id: int, order: Order) -> None:
 
     old_id = order.admin_msg_ids.get(admin_id)
     await set_admin_msgs(order.order_id, {**order.admin_msg_ids, admin_id: sent.message_id})
+    if order.chat_open:
+        # Replies to the re-sent card must reach the customer, exactly like replies to the first card.
+        await record_relay_message(order.order_id, admin_id, sent.message_id)
     if old_id is not None and old_id != sent.message_id:
         try:
             await bot.delete_message(admin_id, old_id)
@@ -762,22 +759,54 @@ async def _send_order_card(bot: Bot, admin_id: int, order: Order) -> None:
             logger.debug("Old order #%s card %s could not be deleted", order.order_id, old_id)
 
 
+async def _show_orders(
+    callback: CallbackQuery,
+    bot: Bot,
+    orders: list[Order],
+    title: str,
+    empty_text: str,
+    nav: InlineKeyboardMarkup,
+) -> None:
+    """Replace the menu message with a header and send one card per order."""
+    if not orders:
+        await _edit(callback, empty_text, nav)
+        await callback.answer()
+        return
+    header = f"{title} {len(orders)} ta"
+    if len(orders) >= _MAX_ORDERS:
+        header += f" (eng eski {_MAX_ORDERS} tasi)"
+    await _edit(callback, header, nav)
+    await callback.answer()
+    admin_id = callback.from_user.id
+    for order in orders:
+        await _send_order_card(bot, admin_id, order)
+
+
 @router.callback_query(F.data == ORDERS_CALLBACK)
 @_db_guard
 async def on_orders(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """List pending orders as cards with accept/reject buttons."""
     await state.clear()
-    orders = await list_pending(_MAX_ORDERS)
-    back = InlineKeyboardMarkup(inline_keyboard=[_menu_row()])
-    if not orders:
-        await _edit(callback, "\U0001f9fe Kutilayotgan buyurtma yo'q.", back)
-        await callback.answer()
-        return
-    header = f"\U0001f9fe <b>Kutilayotgan buyurtmalar:</b> {len(orders)} ta"
-    if len(orders) >= _MAX_ORDERS:
-        header += f" (eng eski {_MAX_ORDERS} tasi)"
-    await _edit(callback, header, back)
-    await callback.answer()
-    admin_id = callback.from_user.id
-    for order in orders:
-        await _send_order_card(bot, admin_id, order)
+    await _show_orders(
+        callback,
+        bot,
+        await list_pending(_MAX_ORDERS),
+        "\U0001f9fe <b>Kutilayotgan buyurtmalar:</b>",
+        "\U0001f9fe Kutilayotgan buyurtma yo'q.",
+        _orders_nav("\U0001f69a Jarayondagi buyurtmalar", IN_PROGRESS_CALLBACK),
+    )
+
+
+@router.callback_query(F.data == IN_PROGRESS_CALLBACK)
+@_db_guard
+async def on_orders_in_progress(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """List accepted, not yet finished orders as cards with done / cancel buttons."""
+    await state.clear()
+    await _show_orders(
+        callback,
+        bot,
+        await list_in_progress(_MAX_ORDERS),
+        "\U0001f69a <b>Jarayondagi buyurtmalar:</b>",
+        "\U0001f69a Jarayondagi buyurtma yo'q.",
+        _orders_nav("\u23f3 Kutilayotgan buyurtmalar", ORDERS_CALLBACK),
+    )

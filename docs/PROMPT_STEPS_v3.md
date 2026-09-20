@@ -74,7 +74,9 @@ BotSettings: new_multi, mid_multi, old_multi, interval_mins, night_start:str, ni
              new_keep, mid_keep, autopost_enabled:bool, repost_policy('delete_previous'|'keep')
 PostLog: id, product_id, chat_id, message_id, is_text_only:bool, posted_at, is_live:bool
 Order:   order_id, product_id, user_id, username, user_fullname, comment,
-         status('pending'|'accepted'|'rejected'), admin_msg_ids:dict[int,int], created_at, updated_at
+         status('pending'|'accepted'|'rejected'), admin_msg_ids:dict[int,int], created_at, updated_at,
+         chat_open:bool, quantity:int=1, phone:str, address:str, outcome('' | 'completed' | 'cancelled'),
+         remind_count:int, reminded_at:datetime|None
 
 # db/engine.py
 engine; async def init_db() -> None; async def dispose_db() -> None
@@ -108,12 +110,19 @@ async def mark_post_dead(post_id:int) -> None
 async def recent_posted_product_ids(n:int) -> list[int]      # newest first
 
 # db/orders.py
-async def create_order(product_id:int, user_id:int, username:str|None, fullname:str, comment:str) -> int
+async def create_order(product_id:int, user_id:int, username:str|None, fullname:str, comment:str, *,
+                       quantity:int=1, phone:str="", address:str="") -> int
 async def get_order(order_id:int) -> Order | None
 async def set_admin_msgs(order_id:int, msgs:dict[int,int]) -> None
 async def decide_order(order_id:int, new_status:str) -> bool  # UPDATE ... WHERE status='pending'; True if changed
 async def recent_pending_exists(user_id:int, product_id:int, minutes:int=10) -> bool
 async def list_pending(limit:int=20) -> list[Order]
+async def finish_order(order_id:int, outcome:str) -> bool      # accepted+open -> outcome 'completed'|'cancelled', closes the chat (atomic)
+async def cancel_pending_by_user(order_id:int, user_id:int) -> bool   # pending -> rejected + outcome 'cancelled' (atomic)
+async def list_user_orders(user_id:int, limit:int=10) -> list[Order]  # newest first
+async def list_in_progress(limit:int=20) -> list[Order]        # accepted and not finished, oldest first
+async def list_due_for_reminder(after_minutes:int, every_minutes:int, max_reminders:int, limit:int=20) -> list[Order]
+async def mark_reminded(order_id:int) -> None                   # remind_count += 1, reminded_at = now (atomic)
 
 # db/keystate.py
 async def mark_key_exhausted(kid:str, until:datetime, reason:str) -> None
@@ -282,13 +291,15 @@ def acquire_single_instance_lock(port:int=47400) -> socket.socket
 - **`post_next(bot, force)`:** skip (returning a message) if `autopost_enabled` is off or it is night and not `force`. Candidates = `list_postable()`, minus products posted within `min_repost_gap_hours` and minus `recent_posted_product_ids(no_repeat_last_n)`; if that leaves none, relax both rules. Weights `new_multi/mid_multi/old_multi` (weight 0 excludes). Choose with `random.choices(population, weights, k=1)` (RNG is injectable). Then `publish_product`.
 - **`create_scheduler` / `apply_interval`:** `AsyncIOScheduler(timezone=TZ)`, job `post_next` every `interval_mins` (from DB) with `max_instances=1`, `coalesce=True`, `misfire_grace_time=interval*30`. `apply_interval` calls `reschedule_job`. Add a daily job `run_downgrade`.
 
-## S10 — Client handlers (deep link and orders)
+## S10 — Client handlers (deep link and order form)
 **Files:** `handlers/client.py`
-- `CommandStart(deep_link=True)`; parse the payload with `^prod_(\d{1,12})$`. Missing, `sold` or `removed` product → `Kechirasiz, ushbu mahsulot mavjud emas / tugagan.` Otherwise send the product photo (`tg_file_id`, caption = `caption_html`) and ask for a question or comment using FSM (`MemoryStorage` is acceptable).
-- Accept text, voice or photo as the comment. Text goes to `orders.comment`; voice/photo are forwarded to admins with `copy_message`. `/cancel` clears the state. The state expires after 30 minutes. Anti-abuse: `recent_pending_exists` blocks duplicates; at most 5 `/start` per minute per user.
-- Create the order (`pending`) BEFORE notifying. Send the message to EVERY admin: product summary, customer as `<a href="tg://user?id=…">name</a>`, `@username` if present, and the comment. Keyboard: `[✅ Qabul qildim]` and `[❌ Qolmagan]` (aiogram `CallbackData` factory). Save `admin_msg_ids` with `set_admin_msgs`.
-- Callbacks (admin-only via `AdminFilter`): `decide_order`; if it returns `False` → answer "Allaqachon hal qilingan". `✅` → user gets `Buyurtmangiz qabul qilindi, tez orada aloqaga chiqamiz.` `❌` → user gets `Kechirasiz, ushbu mahsulot tugagan.` and the admin sees an extra button `[❌ Mahsulotni «Tugadi» qilish]` that calls `poster.mark_sold`. Edit all admins' copies to show the decision. Catch `TelegramForbiddenError` when messaging the user.
-- **HIDDEN FEATURE:** define the state `Checkout.waiting_address` and its handler asking `Iltimos, yetkazib berish manzilini yuboring`, but keep the transition into that state **commented out** with `# HIDDEN FEATURE: re-enable to ask for delivery address`.
+- `CommandStart(deep_link=True)`; parse the payload with `^prod_(\d{1,12})$`. Missing, `sold` or `removed` product → `Kechirasiz, ushbu mahsulot mavjud emas / tugagan.` Otherwise send the product photo (`tg_file_id`, caption = `caption_html`) and start the order form (FSM `OrderFlow`, `MemoryStorage` is acceptable; every step refreshes a 30-minute inactivity window; `/cancel` clears it; at most 5 `/start` per minute per user).
+- **Form steps:** quantity (inline buttons 1-5 or a typed 1-99) → phone (`request_contact` button or typed; normalise to `+<digits>`, a 9-digit number gets `998`; a shared contact must be the sender's own) → address (typed ≥ 5 chars, a shared location stored as a map link, or a `Olib ketaman` button) → optional note (text, voice or photo; voice/photo are copied to the admins with `copy_message`; a `O'tkazib yuborish` button skips) → summary with `[✅ Tasdiqlash]` `[❌ Bekor qilish]`.
+- Only `Tasdiqlash` creates the order (`pending`, with `quantity`, `phone`, `address`, note as `comment`). Guard against a double tap (per-user in-process lock) and against duplicates (`recent_pending_exists`); re-check that the product is still available.
+- Send the order card to EVERY admin (`order_markup`): product, price, quantity, customer as `<a href="tg://user?id=…">name</a>`, `@username`, phone, address, note. Save `admin_msg_ids` with `set_admin_msgs`.
+- Callbacks (admin-only via `AdminFilter`): `decide_order`; `False` → "Allaqachon hal qilingan". `✅ Qabul qildim` → the chat with the customer opens and the card gets `[✅ Bajarildi] [🚫 Bekor qilish]`, `[🔒 Suhbatni yakunlash]`, `[📦 Tugadi]`. `❌ Qolmagan` → the customer is told, the card gets `[📦 Tugadi]`. `Bajarildi` / `Bekor qilish` call `finish_order` (atomic), close the chat, tell the customer and refresh every admin's card.
+- Customer commands: `/buyurtmalarim` lists his latest orders with a status and, for `pending` ones, a cancel button (`cancel_pending_by_user`); the admins' cards are refreshed and they get a short notice.
+- Live chat: after acceptance the customer's messages are relayed to every admin and an admin's native reply is copied back, until the chat is closed (by `Suhbatni yakunlash` or by finishing the order).
 
 ## S11 — Admin filter and settings panel
 **Files:** `handlers/filters.py`, `handlers/admin.py`
@@ -317,3 +328,7 @@ def acquire_single_instance_lock(port:int=47400) -> socket.socket
 **Files:** `README.md`, `tests/test_core.py`, `tests/conftest.py`
 - `README.md`: setup (create bot, add it as admin to both channels with rights, get keys), `.env` guide, run command, troubleshooting. Keep it under 80 lines.
 - Tests (pytest-asyncio, in-memory SQLite, fake provider that raises scripted errors), about 15 focused tests: `is_night` edges (`23:00`, `00:00`, `07:59`, `08:00`); weighted selection with a seeded RNG; `recompute_categories` and locks; price grounding; hashtag normalization; caption ≤ 1024 and HTML escaping; router taxonomy (429 → next pair, 404 → bad pair persisted, 413 → `alt` retry, all fail → `AllProvidersFailed`); sticky rule; `decide_order` idempotency; deep-link regex; queue recovery.
+
+## S15 — Order reminders (added after S14)
+**Files:** `order_reminder.py`, `scheduler.py` (one job), `config.py` / `.env.example` (`ORDER_REMIND_AFTER_MIN`=15, `ORDER_REMIND_EVERY_MIN`=15, `ORDER_REMIND_MAX`=3, `0` = off)
+- `remind_pending_orders(bot) -> int`: every 2 minutes, take `list_due_for_reminder(...)`; re-read each order and skip it if it is no longer `pending`; send every admin a short reminder as a reply to that admin's order card (`ReplyParameters(allow_sending_without_reply=True)`); then `mark_reminded` (also when nobody could be reached, so the loop is bounded). Never raises.

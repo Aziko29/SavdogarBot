@@ -105,6 +105,9 @@ class Settings:
     album_wait_sec: float
     foreign_chat_grace_hours: float  # unregistered chats are left after this many hours
     vision_model_hints: tuple[str, ...]
+    order_remind_after_min: int = 15  # a pending order is first reminded about after this many minutes
+    order_remind_every_min: int = 15  # minimum gap between two reminders about the same order
+    order_remind_max: int = 3  # reminders per order (0 = reminders off)
 
 
 def _is_placeholder(value: str) -> bool:
@@ -284,6 +287,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     photo_max_side = r.integer("PHOTO_MAX_SIDE", 1600, 256, 4096)
     album_wait_sec = r.number("ALBUM_WAIT_SEC", 3.0, 0.0, 30.0)
     foreign_chat_grace_hours = r.number("FOREIGN_CHAT_GRACE_HOURS", 6.0, 0.1, 168.0)
+    order_remind_after_min = r.integer("ORDER_REMIND_AFTER_MIN", 15, 1, 1440)
+    order_remind_every_min = r.integer("ORDER_REMIND_EVERY_MIN", 15, 1, 1440)
+    order_remind_max = r.integer("ORDER_REMIND_MAX", 3, 0, 20)
     vision_hints = tuple(
         hint.lower() for hint in _split_csv(r.text("VISION_MODEL_HINTS", _DEFAULT_VISION_HINTS))
     )
@@ -314,6 +320,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         album_wait_sec=album_wait_sec,
         foreign_chat_grace_hours=foreign_chat_grace_hours,
         vision_model_hints=vision_hints,
+        order_remind_after_min=order_remind_after_min,
+        order_remind_every_min=order_remind_every_min,
+        order_remind_max=order_remind_max,
     )
 
 

@@ -33,6 +33,7 @@ Send `/admin` to the bot in a private chat for settings, product management and 
 - Model names are never hard-coded; check the providers' current model lists before filling them in.
 - Tuning (AI workers, timeouts, repost gap, photo size, album wait) is documented in `.env.example`.
 - Autopost interval, night window, category weights and repost policy are changed in `/admin`, not in `.env`.
+- Order reminders: `ORDER_REMIND_AFTER_MIN` (default 15), `ORDER_REMIND_EVERY_MIN` (default 15) and `ORDER_REMIND_MAX` (default 3, `0` = off); see section 4.
 
 ## 4. How it works
 - Post a photo with a caption in the SOURCE channel; edits re-run the AI. The same photo is never added twice.
@@ -40,6 +41,19 @@ Send `/admin` to the bot in a private chat for settings, product management and 
 - Telegram does not report channel-post deletions to bots: mark a product `removed` or `sold` in the admin panel.
 - **Post ID:** every post in the TARGET channel shows `🆔 ID: <n>`, where `<n>` is the product's database id (`products.id`, the `#<n>` in the admin panel and the `prod_<n>` in the buy button's link). Captions stored before this feature get the line automatically at startup and again right before they are posted or edited; each published message is recorded in `post_log` with its Telegram message id.
 - **AI re-polish:** when an admin edits a product field (name, price, size, fabric, stock) and saves, the value is stored at once, then the AI rewrites the sales pitch and hashtags around the corrected data and the live channel posts are edited to match the database. The AI can never change the admin's values, and a pitch that contains a number not present in the product data is rejected (the plain caption with the admin's data is used instead). If the admin makes another edit while the AI is working, the outdated result is discarded and the newer edit is polished.
+
+## 4a. Orders
+The button under a channel post opens an order form in the bot, one step at a time (every step can be abandoned with `/cancel`, the form expires after 30 minutes of inactivity):
+1. **Quantity** (buttons 1-5 or a typed number), 2. **phone** (the "share my number" button or typed; a 9-digit local number gets `+998`), 3. **address** (typed, a shared location, or "Olib ketaman" for pick-up), 4. optional **note** (text, voice or photo), 5. a summary with **Tasdiqlash / Bekor qilish**.
+
+Only after the customer confirms is the order created and sent to every admin as a card with the quantity, phone, address and note. The lifecycle of an order:
+- `pending` -> the admin taps **Qabul qildim** (`accepted`, the live chat with the customer opens) or **Qolmagan** (`rejected`).
+- `accepted` -> **Bajarildi** (completed) or **Bekor qilish** (cancelled). Either one closes the chat and tells the customer. The card also has **Suhbatni yakunlash** (end the chat only) and **Tugadi** (mark the product sold).
+- While an order is `pending` the customer can withdraw it: `/buyurtmalarim` lists his latest orders with their status and a cancel button; the admins' cards are updated and they get a short notice.
+- `/admin` -> **Buyurtmalar** lists the pending orders; its **Jarayondagi buyurtmalar** button lists the accepted, not yet finished ones.
+- **Reminders:** a pending order that nobody decided within `ORDER_REMIND_AFTER_MIN` minutes is repeated to every admin (as a reply to the order card), then again every `ORDER_REMIND_EVERY_MIN` minutes, at most `ORDER_REMIND_MAX` times. The check runs every 2 minutes and does not depend on the night window.
+
+Existing databases are upgraded automatically at startup (schema v6 adds the new order columns); old orders show quantity 1 and no phone/address.
 
 ## 5. Tests
 ```bash

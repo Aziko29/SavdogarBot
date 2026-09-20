@@ -5,23 +5,34 @@ import logging
 from collections.abc import Mapping
 from datetime import timedelta
 
-from sqlalchemy import exists, insert, select, update
+from sqlalchemy import exists, insert, or_, select, update
 
 from db.engine import dialect_insert, engine, logged_db
-from db.models import ORDER_STATUSES, Order, dump_admin_msg_ids, order_from_row
+from db.models import ORDER_OUTCOMES, ORDER_STATUSES, Order, dump_admin_msg_ids, order_from_row
 from db.schema import chat_relay_t, orders_t
 from utils import utcnow
 
 logger = logging.getLogger("db.orders")
 
 _DECISIONS = tuple(s for s in ORDER_STATUSES if s != "pending")
+_FINAL_OUTCOMES = tuple(o for o in ORDER_OUTCOMES if o)
 
 
 @logged_db
 async def create_order(
-    product_id: int, user_id: int, username: str | None, fullname: str, comment: str
+    product_id: int,
+    user_id: int,
+    username: str | None,
+    fullname: str,
+    comment: str,
+    *,
+    quantity: int = 1,
+    phone: str = "",
+    address: str = "",
 ) -> int:
     """Create a pending order and return its order_id."""
+    if quantity < 1:
+        raise ValueError(f"quantity must be >= 1, got {quantity}")
     async with engine.begin() as conn:
         result = await conn.execute(
             insert(orders_t).values(
@@ -30,6 +41,9 @@ async def create_order(
                 username=username,
                 user_fullname=fullname,
                 comment=comment,
+                quantity=quantity,
+                phone=phone,
+                address=address,
             )
         )
     return int(result.inserted_primary_key[0])
@@ -169,3 +183,110 @@ async def find_order_id_by_relay(admin_id: int, message_id: int) -> int | None:
             )
         ).first()
     return int(row.order_id) if row is not None else None
+
+
+@logged_db
+async def finish_order(order_id: int, outcome: str) -> bool:
+    """Atomically close an accepted, still-open order as completed/cancelled; True only for the caller that did it.
+
+    The live chat is closed in the same statement, so a finished order can never keep relaying messages.
+    """
+    if outcome not in _FINAL_OUTCOMES:
+        raise ValueError(f"outcome must be one of {', '.join(_FINAL_OUTCOMES)}, got {outcome!r}")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            update(orders_t)
+            .where(
+                orders_t.c.order_id == order_id,
+                orders_t.c.status == "accepted",
+                orders_t.c.outcome == "",
+            )
+            .values(outcome=outcome, chat_open=False)
+        )
+    return result.rowcount == 1
+
+
+@logged_db
+async def cancel_pending_by_user(order_id: int, user_id: int) -> bool:
+    """Let the customer withdraw his own order while it is still pending; True if it was withdrawn."""
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            update(orders_t)
+            .where(
+                orders_t.c.order_id == order_id,
+                orders_t.c.user_id == user_id,
+                orders_t.c.status == "pending",
+            )
+            .values(status="rejected", outcome="cancelled", chat_open=False)
+        )
+    return result.rowcount == 1
+
+
+@logged_db
+async def list_user_orders(user_id: int, limit: int = 10) -> list[Order]:
+    """Return this customer's orders, newest first."""
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(orders_t)
+            .where(orders_t.c.user_id == user_id)
+            .order_by(orders_t.c.created_at.desc(), orders_t.c.order_id.desc())
+            .limit(limit)
+        )
+        return [order_from_row(r) for r in rows]
+
+
+@logged_db
+async def list_in_progress(limit: int = 20) -> list[Order]:
+    """Return accepted orders that are neither completed nor cancelled yet, oldest first."""
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(orders_t)
+            .where(orders_t.c.status == "accepted", orders_t.c.outcome == "")
+            .order_by(orders_t.c.created_at, orders_t.c.order_id)
+            .limit(limit)
+        )
+        return [order_from_row(r) for r in rows]
+
+
+@logged_db
+async def list_due_for_reminder(
+    after_minutes: int, every_minutes: int, max_reminders: int, limit: int = 20
+) -> list[Order]:
+    """Pending orders waiting longer than `after_minutes` whose next reminder is due.
+
+    A reminder is due when fewer than `max_reminders` were sent and the previous one (if any)
+    is at least `every_minutes` old. Oldest orders first.
+    """
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    now = utcnow()
+    waited_since = now - timedelta(minutes=after_minutes)
+    last_reminder_before = now - timedelta(minutes=every_minutes)
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(orders_t)
+            .where(
+                orders_t.c.status == "pending",
+                orders_t.c.remind_count < max_reminders,
+                orders_t.c.created_at <= waited_since,
+                or_(orders_t.c.reminded_at.is_(None), orders_t.c.reminded_at <= last_reminder_before),
+            )
+            .order_by(orders_t.c.created_at, orders_t.c.order_id)
+            .limit(limit)
+        )
+        return [order_from_row(r) for r in rows]
+
+
+@logged_db
+async def mark_reminded(order_id: int) -> None:
+    """Record that one more reminder about this still-pending order was sent (atomic counter)."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(orders_t)
+            .where(orders_t.c.order_id == order_id, orders_t.c.status == "pending")
+            .values(remind_count=orders_t.c.remind_count + 1, reminded_at=utcnow())
+        )
