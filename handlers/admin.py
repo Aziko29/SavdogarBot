@@ -31,7 +31,7 @@ from db.admins import is_head_admin
 from db.engine import engine
 from db.schema import orders_t, post_log_t
 from db.settings import MULTI_MAX, MULTI_MIN, get_settings, update_settings
-from handlers.filters import AdminFilter
+from handlers.filters import AdminFilter, HeadAdminFilter
 from scheduler import apply_interval, is_night, post_next
 from utils import local_now
 from worker import PRODUCT_QUEUE
@@ -87,6 +87,7 @@ _STALE_TEXT = "Xabar eskirgan, /admin yuboring."
 _BAD_VALUE_TEXT = "Noto'g'ri qiymat."
 _SAVED_TEXT = "Saqlandi \u2705"
 _CANCELLED_TEXT = "Bekor qilindi."
+_HEAD_ONLY_TEXT = "\u26d4 Sozlamalarni faqat bosh admin o'zgartira oladi."
 
 
 class AdminInput(StatesGroup):
@@ -154,19 +155,17 @@ def _btn(text: str, callback_data: str) -> InlineKeyboardButton:
 
 
 def _root_markup(user_id: int | None = None) -> InlineKeyboardMarkup:
-    """Keyboard of the root admin menu, grouped 2-per-row; the admin-management row is head-admin only."""
+    """Keyboard of the root admin menu, grouped 2-per-row; Sozlamalar and the admin-management row are head-admin only."""
     rows = [
         [
             _btn("\U0001f4e6 Mahsulotlar", PRODUCTS_CALLBACK),
             _btn("\U0001f9fe Buyurtmalar", ORDERS_CALLBACK),
         ],
-        [
-            _btn("\u2699\ufe0f Sozlamalar", MenuCB(action="settings").pack()),
-            _btn("\U0001f4ca Holat", MenuCB(action="status").pack()),
-        ],
+        [_btn("\U0001f4ca Holat", MenuCB(action="status").pack())],
         [_btn("\U0001f680 Hoziroq post qilish", MenuCB(action="postnow").pack())],
     ]
     if is_head_admin(user_id):
+        rows[1].insert(0, _btn("\u2699\ufe0f Sozlamalar", MenuCB(action="settings").pack()))
         rows.append(
             [
                 _btn("\U0001f465 Adminlar", ADMINS_CALLBACK),
@@ -326,7 +325,7 @@ async def on_root(callback: CallbackQuery, state: FSMContext) -> None:
 # ---------------------------------------------------------------- settings
 
 
-@router.callback_query(MenuCB.filter(F.action == "settings"))
+@router.callback_query(MenuCB.filter(F.action == "settings"), HeadAdminFilter())
 @_db_guard
 async def on_settings(callback: CallbackQuery, state: FSMContext) -> None:
     """Open the settings panel."""
@@ -335,13 +334,13 @@ async def on_settings(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(SetCB.filter(F.op == "noop"))
+@router.callback_query(SetCB.filter(F.op == "noop"), HeadAdminFilter())
 async def on_noop(callback: CallbackQuery) -> None:
     """Acknowledge taps on label-only buttons."""
     await callback.answer()
 
 
-@router.callback_query(SetCB.filter(F.op == "adj"))
+@router.callback_query(SetCB.filter(F.op == "adj"), HeadAdminFilter())
 @_db_guard
 async def on_adjust(callback: CallbackQuery, callback_data: SetCB) -> None:
     """Step a multiplier or keep-count up or down."""
@@ -367,7 +366,7 @@ async def on_adjust(callback: CallbackQuery, callback_data: SetCB) -> None:
     await callback.answer()
 
 
-@router.callback_query(SetCB.filter(F.op == "interval"))
+@router.callback_query(SetCB.filter(F.op == "interval"), HeadAdminFilter())
 @_db_guard
 async def on_interval_preset(callback: CallbackQuery, callback_data: SetCB, scheduler: AsyncIOScheduler) -> None:
     """Apply one of the interval presets."""
@@ -384,7 +383,7 @@ async def on_interval_preset(callback: CallbackQuery, callback_data: SetCB, sche
     await _show_settings(callback)
 
 
-@router.callback_query(SetCB.filter(F.op.in_(set(_PROMPTS))))
+@router.callback_query(SetCB.filter(F.op.in_(set(_PROMPTS))), HeadAdminFilter())
 async def on_prompt(callback: CallbackQuery, callback_data: SetCB, state: FSMContext) -> None:
     """Ask the admin to type a custom interval or a night-window time."""
     msg = callback.message
@@ -401,7 +400,7 @@ async def on_prompt(callback: CallbackQuery, callback_data: SetCB, state: FSMCon
     await callback.answer()
 
 
-@router.callback_query(SetCB.filter(F.op.in_({"auto", "policy"})))
+@router.callback_query(SetCB.filter(F.op.in_({"auto", "policy"})), HeadAdminFilter())
 @_db_guard
 async def on_toggle(callback: CallbackQuery, callback_data: SetCB) -> None:
     """Toggle autopost or the repost policy."""
@@ -419,7 +418,7 @@ async def on_toggle(callback: CallbackQuery, callback_data: SetCB) -> None:
     await callback.answer()
 
 
-@router.callback_query(SetCB.filter(F.op == "cancel"))
+@router.callback_query(SetCB.filter(F.op == "cancel"), HeadAdminFilter())
 @_db_guard
 async def on_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     """Abandon a typed-input prompt and return to the settings panel."""
@@ -435,7 +434,7 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await message.answer(_CANCELLED_TEXT)
 
 
-@router.message(AdminInput.interval, F.text)
+@router.message(AdminInput.interval, F.text, HeadAdminFilter())
 @_db_guard
 async def on_interval_input(message: Message, state: FSMContext, scheduler: AsyncIOScheduler) -> None:
     """Handle a typed custom interval."""
@@ -455,7 +454,7 @@ async def on_interval_input(message: Message, state: FSMContext, scheduler: Asyn
     await _send_settings(message)
 
 
-@router.message(StateFilter(AdminInput.night_start, AdminInput.night_end), F.text)
+@router.message(StateFilter(AdminInput.night_start, AdminInput.night_end), F.text, HeadAdminFilter())
 @_db_guard
 async def on_night_input(message: Message, state: FSMContext) -> None:
     """Handle a typed night-window start or end time."""
@@ -471,10 +470,29 @@ async def on_night_input(message: Message, state: FSMContext) -> None:
     await _send_settings(message)
 
 
-@router.message(StateFilter(AdminInput))
+@router.message(StateFilter(AdminInput), HeadAdminFilter())
 async def on_input_not_text(message: Message) -> None:
     """Remind the admin that typed input must be text."""
     await message.answer("Iltimos, matn yuboring yoki /cancel.")
+
+
+# Regular admins never see the Sozlamalar button, but an old menu message or a hand-made callback can
+# still reach these handlers. Anything settings-related that the head-admin handlers above did not take
+# ends up here: refused, nothing changed.
+
+
+@router.callback_query(MenuCB.filter(F.action == "settings"))
+@router.callback_query(SetCB.filter())
+async def on_settings_denied(callback: CallbackQuery) -> None:
+    """A non-head admin tried to open or change the settings."""
+    await callback.answer(_HEAD_ONLY_TEXT, show_alert=True)
+
+
+@router.message(StateFilter(AdminInput))
+async def on_input_denied(message: Message, state: FSMContext) -> None:
+    """A non-head admin is stuck in a settings-input state: drop it instead of letting him edit settings."""
+    await state.clear()
+    await message.answer(_HEAD_ONLY_TEXT)
 
 
 # ---------------------------------------------------------------- post now
