@@ -13,6 +13,7 @@ from config import settings
 from db.posts import recent_posted_product_ids
 from db.products import list_postable, recompute_categories
 from db.settings import get_settings
+from inquiry_idle import sweep_idle_inquiries
 from log_sender import send_logs_job
 from logging_setup import cleanup_old_logs
 from order_reminder import remind_pending_orders
@@ -118,6 +119,8 @@ _CHAT_GUARD_JOB_ID = "chat_guard"
 _CHAT_GUARD_INTERVAL_MIN = 10
 _ORDER_REMIND_JOB_ID = "order_reminder"
 _ORDER_REMIND_CHECK_MIN = 2
+_INQUIRY_IDLE_JOB_ID = "inquiry_idle"
+_INQUIRY_IDLE_CHECK_MIN = 2
 
 
 def create_scheduler(bot: Bot) -> AsyncIOScheduler:
@@ -177,6 +180,16 @@ def create_scheduler(bot: Bot) -> AsyncIOScheduler:
             coalesce=True,
             misfire_grace_time=300,
         )
+    scheduler.add_job(
+        sweep_idle_inquiries,
+        "interval",
+        minutes=_INQUIRY_IDLE_CHECK_MIN,
+        args=(bot,),
+        id=_INQUIRY_IDLE_JOB_ID,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
     if settings.owner_id and settings.log_send_hours > 0:
         # First delivery shortly after start (so a crash/restart log reaches the owner), then every N hours.
         scheduler.add_job(

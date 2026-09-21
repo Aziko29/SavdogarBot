@@ -1,6 +1,7 @@
 """Client-facing flow: deep-link product entry, the order form, admin decisions, order lifecycle and live chat."""
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -9,7 +10,7 @@ from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
@@ -25,6 +26,7 @@ from aiogram.types import (
     ReplyParameters,
 )
 
+from config import settings
 from db.admins import admin_ids, is_admin
 from db.orders import (
     cancel_pending_by_user,
@@ -44,10 +46,16 @@ from db.orders import (
 from db.inquiries import (
     close_inquiry_if_open,
     find_inquiry_user_by_relay,
+    get_inquiry_history,
     get_open_inquiry,
     open_inquiry,
+    pop_inquiry_notice_cards,
+    record_inquiry_history,
     record_inquiry_relay,
+    replace_inquiry_notice_cards,
     touch_inquiry,
+    try_claim_inquiry,
+    try_continue_inquiry,
 )
 from db.products import get_product
 from handlers.filters import AdminFilter, NotAdminFilter
@@ -56,6 +64,7 @@ from poster import mark_sold
 if TYPE_CHECKING:
     from aiogram import Bot
 
+    from db.inquiries import Inquiry
     from db.models import Order, Product
 
 logger = logging.getLogger("handlers.client")
@@ -165,6 +174,32 @@ _NOTHING_TO_CANCEL_TEXT = "Bekor qilinadigan narsa yo'q."
 _INQUIRY_CLOSED_BY_USER_ADMIN_TEXT = "\U0001f512 Mijoz suhbatni yakunladi."
 _INQUIRY_HEADER = "\U0001f4ac <b>Savol</b> \u2014 {name} dan xabar:"
 _INQUIRY_CARD_HINT = "Javob berish uchun shu xabarga (yoki mijozning keyingi xabariga) reply qiling."
+_CLAIM_BUTTON_TEXT = "\u2705 Qabul qilish"
+_INQUIRY_CLAIMED_TEXT = "\u2705 Siz qabul qildingiz. Endi mijozning barcha xabarlari sizga keladi."
+_INQUIRY_TAKEN_ALERT_TEXT = "Bu suhbatni {name} allaqachon qabul qildi."
+_INQUIRY_TAKEN_REPLY_TEXT = "Bu suhbatni allaqachon {name} qabul qilgan \u2014 javobingiz yuborilmadi."
+_INQUIRY_TAKEN_CARD_TEXT = "\U0001f512 Bu suhbatni {name} qabul qildi."
+_INQUIRY_PRODUCT_LINE = "Mahsulot: <b>{name}</b> (id={id})\nNarxi: {price}"
+_INQUIRY_HISTORY_HEADER = "\U0001f4dc <b>Suhbat tarixi:</b>"
+_INQUIRY_NO_HISTORY_TEXT = "(hozircha xabar almashinuvi yo'q)"
+_INQUIRY_CONTINUE_BUTTON_TEXT = "\u25b6\ufe0f Davom ettirish"
+_INQUIRY_IDLE_TEXT = (
+    "\u23f0 <b>Suhbat harakatsiz</b> \u2014 {name} bilan suhbatda ~{hours:g} soatdan beri xabar yo'q."
+)
+_INQUIRY_IDLE_OWNER_LINE = "Hozir suhbatni olib borayotgan admin: {owner}"
+_INQUIRY_IDLE_QUESTION = "Davom ettirasizmi yoki tugatasizmi?"
+_INQUIRY_IDLE_TAKEN_CARD_TEXT = "\U0001f512 Suhbatni {name} davom ettirdi."
+_INQUIRY_ACTIVE_AGAIN_TEXT = "\u2705 Suhbat yana davom etmoqda \u2014 bu so'rov endi kerak emas."
+_INQUIRY_CONTINUED_TEXT = "\u25b6\ufe0f Suhbat sizga o'tdi."
+_INQUIRY_CONTINUE_TAKEN_ALERT_TEXT = "Bu suhbat allaqachon davom etmoqda ({name})."
+_INQUIRY_CONTINUE_INTRO = "\u25b6\ufe0f <b>Suhbat sizga o'tdi</b>"
+_INQUIRY_CONTINUE_READY_TEXT = (
+    "\u2705 Endi mijozning yangi xabarlari faqat sizga keladi.\n"
+    "Javob berish uchun yuqoridagi xabarlardan biriga (yoki mijozning keyingi xabariga) reply qiling."
+)
+_INQUIRY_HISTORY_TRUNCATED_TEXT = "(faqat oxirgi {shown} ta xabar ko'rsatildi, jami {total} ta)"
+_INQUIRY_HISTORY_MAX = 50  # replayed messages per hand-over; older ones are summarised, not sent
+_TG_RETRY_CAP_SEC = 30.0  # longest flood-control wait we sit through inside a handler
 _PLAIN_START_TEXT = (
     "Assalomu alaykum! Buyurtma berish yoki mahsulot haqida savol berish uchun "
     "kanaldagi mahsulot ostidagi havolani bosing.\n"
@@ -203,6 +238,18 @@ class ProductActionCB(CallbackData, prefix="pact"):
 
 class InquiryCloseCB(CallbackData, prefix="inqcl"):
     """Admin tapped 'end chat' on a customer inquiry (a chat that is not tied to an order)."""
+
+    user_id: int
+
+
+class InquiryClaimCB(CallbackData, prefix="inqac"):
+    """Admin tapped 'Qabul qilish' first: the inquiry is now his alone."""
+
+    user_id: int
+
+
+class InquiryContinueCB(CallbackData, prefix="inqct"):
+    """Admin tapped 'continue' on the 1-hour idle notice, re-claiming a quiet inquiry."""
 
     user_id: int
 
@@ -491,30 +538,173 @@ async def on_product_order(
     await message.answer(_ASK_QUANTITY_TEXT, reply_markup=_quantity_markup())
 
 
+def _inquiry_product_lines(product: Product | None) -> list[str]:
+    """Product info line(s) for an inquiry card/history, with its id (empty list if no product)."""
+    if product is None:
+        return []
+    return [_INQUIRY_PRODUCT_LINE.format(name=html.escape(product.name), id=product.id, price=html.escape(product.price))]
+
+
+def _inquiry_claim_markup(user_id: int) -> InlineKeyboardMarkup:
+    """Buttons on the initial, unclaimed inquiry card: accept it, or end it outright."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=_CLAIM_BUTTON_TEXT, callback_data=InquiryClaimCB(user_id=user_id).pack())],
+            [InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user_id).pack())],
+        ]
+    )
+
+
+def _inquiry_owned_markup(user_id: int) -> InlineKeyboardMarkup:
+    """Buttons once an admin owns the chat: just the ability to end it."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user_id).pack())
+        ]]
+    )
+
+
+async def _disable_other_notice_cards(bot: Bot, cards: list[tuple[int, int]], winner_admin_id: int, taken_text: str) -> None:
+    """Replace every OTHER admin's now-stale accept/continue card with a plain "taken" notice."""
+    for admin_id, message_id in cards:
+        if admin_id == winner_admin_id:
+            continue
+        try:
+            await bot.edit_message_text(taken_text, chat_id=admin_id, message_id=message_id, reply_markup=None)
+        except TelegramBadRequest:
+            pass  # already edited/deleted by the admin, or the text didn't change; harmless
+        except Exception:
+            logger.exception("Failed to update inquiry card for admin %s", admin_id)
+
+
+async def _tg_call(method: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run one Telegram call, sitting out a single (bounded) flood-control answer before giving up."""
+    try:
+        return await method(*args, **kwargs)
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(min(float(exc.retry_after), _TG_RETRY_CAP_SEC))
+        return await method(*args, **kwargs)
+
+
+async def _send_inquiry_context(
+    bot: Bot, admin_id: int, user_id: int, product: Product | None, customer_name: str = ""
+) -> None:
+    """Hand a newly (re)claiming admin everything he needs: the customer, the product with its id, the talk so far.
+
+    Every message sent here is registered as belonging to the inquiry, so replying to any of them
+    reaches the customer; the last one also carries the "end chat" button.
+    """
+    customer = html.escape(customer_name) if customer_name else str(user_id)
+    intro = [_INQUIRY_CONTINUE_INTRO, "", f'Mijoz: <a href="tg://user?id={user_id}">{customer}</a>']
+    intro.extend(_inquiry_product_lines(product))
+    try:
+        sent = await _tg_call(bot.send_message, admin_id, "\n".join(intro), parse_mode="HTML")
+        await record_inquiry_relay(user_id, admin_id, sent.message_id)
+
+        entries = await get_inquiry_history(user_id)
+        await _tg_call(bot.send_message, admin_id, _INQUIRY_HISTORY_HEADER, parse_mode="HTML")
+        if not entries:
+            await _tg_call(bot.send_message, admin_id, _INQUIRY_NO_HISTORY_TEXT)
+        if len(entries) > _INQUIRY_HISTORY_MAX:
+            note = _INQUIRY_HISTORY_TRUNCATED_TEXT.format(shown=_INQUIRY_HISTORY_MAX, total=len(entries))
+            await _tg_call(bot.send_message, admin_id, note)
+            entries = entries[-_INQUIRY_HISTORY_MAX:]
+
+        last_sender: str | None = None
+        for entry in entries:
+            try:
+                if entry.sender != last_sender:  # one label per run of messages keeps the replay short
+                    label = "\U0001f9d1 Mijoz:" if entry.sender == "customer" else "\U0001f6e1 Admin:"
+                    await _tg_call(bot.send_message, admin_id, label)
+                    last_sender = entry.sender
+                copied = await _tg_call(
+                    bot.copy_message, chat_id=admin_id, from_chat_id=entry.chat_id, message_id=entry.message_id
+                )
+                await record_inquiry_relay(user_id, admin_id, copied.message_id)
+            except TelegramForbiddenError:
+                raise
+            except TelegramBadRequest:
+                logger.info("Inquiry of user %s: history message %s is gone; skipped", user_id, entry.message_id)
+            except Exception:
+                logger.exception("Inquiry of user %s: could not replay one history message to admin %s", user_id, admin_id)
+
+        ready = await _tg_call(
+            bot.send_message, admin_id, _INQUIRY_CONTINUE_READY_TEXT, reply_markup=_inquiry_owned_markup(user_id)
+        )
+        await record_inquiry_relay(user_id, admin_id, ready.message_id)
+    except TelegramForbiddenError:
+        logger.warning("Admin %s has not started the bot; inquiry history not delivered", admin_id)
+    except Exception:
+        logger.exception("Failed to send the inquiry context to admin %s for user %s", admin_id, user_id)
+
+
 async def _notify_admins_inquiry(bot: Bot, user: Any, product: Product | None) -> None:
-    """Tell every admin that a customer wants to talk; each card is a reply target for the answer."""
+    """Tell every admin that a customer wants to talk; whoever accepts first owns the chat."""
     customer_link = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
     lines = ["\U0001f4ac <b>Yangi savol</b>", "", f"Mijoz: {customer_link}"]
     if user.username:
         lines.append(f"@{user.username}")
-    if product is not None:
-        lines.append(f"Mahsulot: <b>{html.escape(product.name)}</b> (id={product.id})")
-        lines.append(f"Narxi: {html.escape(product.price)}")
+    lines.extend(_inquiry_product_lines(product))
     lines.extend(["", _INQUIRY_CARD_HINT])
     text = "\n".join(lines)
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user.id).pack())
-        ]]
-    )
+    markup = _inquiry_claim_markup(user.id)
+    cards: list[tuple[int, int]] = []
     for admin_id in admin_ids():
         try:
             sent = await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=markup)
             await record_inquiry_relay(user.id, admin_id, sent.message_id)
+            cards.append((admin_id, sent.message_id))
         except TelegramForbiddenError:
             logger.warning("Admin %s has not started the bot; inquiry notice not delivered", admin_id)
         except Exception:
             logger.exception("Failed to notify admin %s about an inquiry of user %s", admin_id, user.id)
+    await replace_inquiry_notice_cards(user.id, cards)
+
+
+def _inquiry_idle_markup(user_id: int) -> InlineKeyboardMarkup:
+    """Buttons on the 1-hour idle notice: keep the chat going (as the tapping admin) or end it."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=_INQUIRY_CONTINUE_BUTTON_TEXT, callback_data=InquiryContinueCB(user_id=user_id).pack()),
+            InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user_id).pack()),
+        ]]
+    )
+
+
+async def notify_admins_inquiry_idle(bot: Bot, inquiry: Inquiry, product: Product | None) -> int:
+    """Ask EVERY admin whether a quiet, claimed inquiry should go on or end; returns how many got the card.
+
+    The cards are tracked, so the first admin to decide (or the chat waking up by itself) can
+    retire all the others. Called by the `inquiry_idle` sweep.
+    """
+    owner = "\u2014"
+    if inquiry.claimed_by is not None:
+        owner = await _admin_label(bot, inquiry.claimed_by)
+    customer = f'<a href="tg://user?id={inquiry.user_id}">{html.escape(inquiry.user_fullname or str(inquiry.user_id))}</a>'
+    lines = [_INQUIRY_IDLE_TEXT.format(name=customer, hours=settings.inquiry_idle_hours)]
+    lines.extend(_inquiry_product_lines(product))
+    lines.extend(["", _INQUIRY_IDLE_OWNER_LINE.format(owner=html.escape(owner)), _INQUIRY_IDLE_QUESTION])
+    text = "\n".join(lines)
+    markup = _inquiry_idle_markup(inquiry.user_id)
+
+    cards: list[tuple[int, int]] = []
+    for admin_id in admin_ids():
+        try:
+            sent = await _tg_call(bot.send_message, admin_id, text, parse_mode="HTML", reply_markup=markup)
+            cards.append((admin_id, sent.message_id))
+        except TelegramForbiddenError:
+            logger.warning("Admin %s has not started the bot; inquiry idle notice not delivered", admin_id)
+        except Exception:
+            logger.exception("Failed to send the idle notice of user %s's inquiry to admin %s", inquiry.user_id, admin_id)
+    await replace_inquiry_notice_cards(inquiry.user_id, cards)
+    return len(cards)
+
+
+async def _dismiss_idle_cards(bot: Bot, user_id: int) -> None:
+    """The chat is active again: retire any outstanding "continue or end?" cards (no-op when there are none)."""
+    cards = await pop_inquiry_notice_cards(user_id)
+    if cards:
+        await _disable_other_notice_cards(bot, cards, 0, _INQUIRY_ACTIVE_AGAIN_TEXT)  # 0: nobody is exempt
 
 
 @router.callback_query(ProductActionCB.filter(F.action == "ask"))
@@ -1111,10 +1301,26 @@ async def on_chat_close(callback: CallbackQuery, callback_data: ChatCloseCB, bot
     await _safe_answer(callback, _CHAT_CLOSED_ADMIN_TEXT)
 
 
+async def _admin_label(bot: Bot, admin_id: int) -> str:
+    """Best-effort plain-text name of an admin, for "already taken by ..." messages; falls back to the id.
+
+    Plain text on purpose (alerts, replies and edited cards carry no parse mode); callers that put
+    it into an HTML message must `html.escape` it themselves.
+    """
+    try:
+        chat = await bot.get_chat(admin_id)
+        name = " ".join(part for part in (chat.first_name, chat.last_name) if part) or chat.username
+        return name or str(admin_id)
+    except Exception:
+        return str(admin_id)
+
+
 async def _reply_to_inquiry(message: Message, bot: Bot, replied_to_id: int) -> None:
     """An admin replied to an inquiry message: pass the answer on to that customer.
 
     Anything that is not a relayed inquiry message (a normal admin-panel reply) is ignored.
+    Replying also counts as accepting the chat when nobody has yet (see `try_claim_inquiry`);
+    if someone else already claimed it, the reply is refused instead of being sent.
     """
     admin = message.from_user
     if admin is None:
@@ -1122,10 +1328,23 @@ async def _reply_to_inquiry(message: Message, bot: Bot, replied_to_id: int) -> N
     user_id = await find_inquiry_user_by_relay(admin.id, replied_to_id)
     if user_id is None:
         return
-    # touch_inquiry() also restarts the inactivity window, so the customer can answer the reply.
-    if not await touch_inquiry(user_id):
+    claim = await try_claim_inquiry(user_id, admin.id)
+    if not claim.is_open:
         await message.reply(_CHAT_ALREADY_CLOSED_TEXT)
         return
+    if not claim.success:
+        other = await _admin_label(bot, claim.claimed_by) if claim.claimed_by is not None else "boshqa admin"
+        await message.reply(_INQUIRY_TAKEN_REPLY_TEXT.format(name=other))
+        return
+    if claim.newly_claimed:
+        cards = await pop_inquiry_notice_cards(user_id)
+        await _disable_other_notice_cards(
+            bot, cards, admin.id, _INQUIRY_TAKEN_CARD_TEXT.format(name=admin.full_name)
+        )
+    else:
+        await _dismiss_idle_cards(bot, user_id)  # the owner is answering after all: no need to ask around
+    # touch_inquiry() also restarts the inactivity window, so the customer can answer the reply.
+    await touch_inquiry(user_id)
     try:
         await bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
     except TelegramForbiddenError:
@@ -1135,6 +1354,7 @@ async def _reply_to_inquiry(message: Message, bot: Bot, replied_to_id: int) -> N
         logger.exception("Inquiry of user %s: failed to relay the admin reply", user_id)
         await message.reply(_RELAY_SENT_TO_ADMIN_FAIL)
         return
+    await record_inquiry_history(user_id, message.chat.id, message.message_id, "admin")
     try:
         await message.reply(_RELAY_DELIVERED_TEXT)
     except Exception:
@@ -1181,20 +1401,92 @@ async def on_admin_chat_reply(message: Message, bot: Bot) -> None:
         pass  # A missing confirmation shouldn't matter; the reply already reached the customer.
 
 
+@router.callback_query(InquiryClaimCB.filter(), AdminFilter())
+async def on_inquiry_claim(callback: CallbackQuery, callback_data: InquiryClaimCB, bot: Bot) -> None:
+    """Admin tapped 'Qabul qilish' on the initial card: he alone now owns this inquiry."""
+    admin = callback.from_user
+    claim = await try_claim_inquiry(callback_data.user_id, admin.id)
+    if not claim.is_open:
+        await _safe_answer(callback, _CHAT_ALREADY_CLOSED_TEXT, show_alert=True)
+        return
+    if not claim.success:
+        other = await _admin_label(bot, claim.claimed_by) if claim.claimed_by is not None else "boshqa admin"
+        await _safe_answer(callback, _INQUIRY_TAKEN_ALERT_TEXT.format(name=other), show_alert=True)
+        return
+
+    await _safe_answer(callback, _INQUIRY_CLAIMED_TEXT)
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=_inquiry_owned_markup(callback_data.user_id))
+        except TelegramBadRequest:
+            pass
+    if claim.newly_claimed:
+        cards = await pop_inquiry_notice_cards(callback_data.user_id)
+        await _disable_other_notice_cards(
+            bot, cards, admin.id, _INQUIRY_TAKEN_CARD_TEXT.format(name=admin.full_name)
+        )
+
+
+@router.callback_query(InquiryContinueCB.filter(), AdminFilter())
+async def on_inquiry_continue(callback: CallbackQuery, callback_data: InquiryContinueCB, bot: Bot) -> None:
+    """Admin tapped 'Davom ettirish' on the 1-hour idle notice: the chat is his now, with everything shown.
+
+    The first tap wins (atomic, see `try_continue_inquiry`); the other admins' cards are retired.
+    He then gets the customer, the product with its id and the whole transcript so far, since he may
+    not have followed the conversation from the start.
+    """
+    admin = callback.from_user
+    user_id = callback_data.user_id
+    result = await try_continue_inquiry(user_id, admin.id)
+    if not result.success:
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)  # this card is stale either way
+            except TelegramBadRequest:
+                pass
+        if not result.is_open:
+            await _safe_answer(callback, _CHAT_ALREADY_CLOSED_TEXT, show_alert=True)
+            return
+        other = await _admin_label(bot, result.claimed_by) if result.claimed_by is not None else "boshqa admin"
+        await _safe_answer(callback, _INQUIRY_CONTINUE_TAKEN_ALERT_TEXT.format(name=other), show_alert=True)
+        return
+
+    await _safe_answer(callback, _INQUIRY_CONTINUED_TEXT)
+    cards = await pop_inquiry_notice_cards(user_id)
+    await _disable_other_notice_cards(bot, cards, admin.id, _INQUIRY_IDLE_TAKEN_CARD_TEXT.format(name=admin.full_name))
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=_inquiry_owned_markup(user_id))
+        except TelegramBadRequest:
+            pass
+        await record_inquiry_relay(user_id, admin.id, callback.message.message_id)  # replying to the card works too
+
+    inquiry = await get_open_inquiry(user_id)
+    if inquiry is None:  # closed or expired within the last instants; nothing to hand over
+        return
+    product = await get_product(inquiry.product_id) if inquiry.product_id is not None else None
+    await _send_inquiry_context(bot, admin.id, user_id, product, inquiry.user_fullname)
+
+
 async def _relay_inquiry_message(message: Message, bot: Bot) -> None:
-    """Relay a customer's message to every admin when he has an open inquiry; otherwise do nothing."""
+    """Relay a customer's message: to the admin who owns the chat, or to every admin until someone claims it."""
     user = message.from_user
-    if user is None or await get_open_inquiry(user.id) is None:
+    if user is None:
+        return
+    inquiry = await get_open_inquiry(user.id)
+    if inquiry is None:
         return
     await touch_inquiry(user.id)
+    if inquiry.claimed_by is not None:
+        await _dismiss_idle_cards(bot, user.id)  # he wrote again: any "continue or end?" card is obsolete
+    await record_inquiry_history(user.id, message.chat.id, message.message_id, "customer")
 
     header = _INQUIRY_HEADER.format(name=html.escape(user.full_name))
-    close_markup = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text=_CLOSE_CHAT_BUTTON_TEXT, callback_data=InquiryCloseCB(user_id=user.id).pack())
-        ]]
-    )
-    for admin_id in admin_ids():
+    close_markup = _inquiry_owned_markup(user.id)
+    # Once claimed, only that admin gets the rest of the conversation; before that, everyone does,
+    # so the request doesn't stall if nobody has tapped "Qabul qilish" yet.
+    targets = [inquiry.claimed_by] if inquiry.claimed_by is not None else list(admin_ids())
+    for admin_id in targets:
         try:
             await bot.send_message(admin_id, header, parse_mode="HTML")
             sent = await bot.copy_message(
@@ -1212,15 +1504,19 @@ async def _relay_inquiry_message(message: Message, bot: Bot) -> None:
 
 @router.callback_query(InquiryCloseCB.filter(), AdminFilter())
 async def on_inquiry_close(callback: CallbackQuery, callback_data: InquiryCloseCB, bot: Bot) -> None:
-    """An admin tapped 'end chat' on an inquiry; closes it and lets the customer know."""
+    """An admin tapped 'end chat' on an inquiry; closes it, clears any pending card, and tells the customer."""
+    cards = await pop_inquiry_notice_cards(callback_data.user_id)
     if not await close_inquiry_if_open(callback_data.user_id):
         await _safe_answer(callback, _CHAT_ALREADY_CLOSED_TEXT, show_alert=True)
         return
+    closer_id = callback.from_user.id if callback.from_user is not None else -1
     if isinstance(callback.message, Message):
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
+    if cards:
+        await _disable_other_notice_cards(bot, cards, closer_id, _CHAT_CLOSED_ADMIN_TEXT)
     try:
         await bot.send_message(callback_data.user_id, _INQUIRY_CLOSED_USER_TEXT)
     except TelegramForbiddenError:

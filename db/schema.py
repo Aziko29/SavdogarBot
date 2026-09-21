@@ -212,7 +212,9 @@ chat_relay_t = Table(
 
 # Customer inquiries: a live chat with the admins that is NOT tied to an order (the customer tapped
 # "contact the admin" under a product). One row per customer; `is_open` + `updated_at` decide
-# whether his messages are still relayed.
+# whether his messages are still relayed. `claimed_by` is the one admin currently handling the
+# chat (NULL until someone accepts it); `idle_notice_sent` guards the 1-hour "still there?" ping
+# from firing more than once per idle spell.
 inquiries_t = Table(
     "inquiries",
     metadata,
@@ -220,6 +222,8 @@ inquiries_t = Table(
     Column("product_id", Integer, nullable=True),
     Column("user_fullname", Text, nullable=False, server_default=""),
     Column("is_open", Boolean, nullable=False, server_default=false()),
+    Column("claimed_by", BigInteger, nullable=True),
+    Column("idle_notice_sent", Boolean, nullable=False, server_default=false()),
     Column("updated_at", UTCDateTime, nullable=False, default=_utcnow, onupdate=_utcnow),
 )
 
@@ -234,6 +238,38 @@ inquiry_relay_t = Table(
     Column("created_at", UTCDateTime, nullable=False, default=_utcnow),
     UniqueConstraint("admin_id", "message_id", name="uq_inquiry_admin_message"),
     Index("ix_inquiry_relay_user_id", "user_id"),
+    sqlite_autoincrement=True,
+)
+
+# The currently-live "accept this chat" / "continue or end?" card message sent to each admin for
+# one inquiry. Replaced every time a fresh card goes out, and popped (read + deleted) as soon as
+# it is resolved (claimed, continued or closed), so a stale reference can never outlive its button.
+inquiry_notice_t = Table(
+    "inquiry_notice",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", BigInteger, nullable=False),
+    Column("admin_id", BigInteger, nullable=False),
+    Column("message_id", BigInteger, nullable=False),
+    Column("created_at", UTCDateTime, nullable=False, default=_utcnow),
+    Index("ix_inquiry_notice_user_id", "user_id"),
+    sqlite_autoincrement=True,
+)
+
+# Transcript of one inquiry, in order: enough to replay the conversation (via copy_message, from
+# the original chat_id/message_id) to whichever admin ends up owning it later. `sender` is
+# "customer" or "admin".
+inquiry_history_t = Table(
+    "inquiry_history",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", BigInteger, nullable=False),
+    Column("chat_id", BigInteger, nullable=False),
+    Column("message_id", BigInteger, nullable=False),
+    Column("sender", String(10), nullable=False),
+    Column("created_at", UTCDateTime, nullable=False, default=_utcnow),
+    CheckConstraint(_in_list("sender", ("customer", "admin")), name="sender_valid"),
+    Index("ix_inquiry_history_user_id", "user_id"),
     sqlite_autoincrement=True,
 )
 

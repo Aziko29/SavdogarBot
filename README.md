@@ -33,6 +33,7 @@ Send `/admin` to the bot in a private chat for settings, product management and 
 - Model names are never hard-coded; check the providers' current model lists before filling them in.
 - Tuning (AI workers, timeouts, repost gap, photo size, album wait) is documented in `.env.example`.
 - Autopost interval, night window, category weights and repost policy are changed in `/admin`, not in `.env`.
+- Quiet inquiries: `INQUIRY_IDLE_HOURS` (default 1, range 0.05-24): how long a claimed inquiry may stay silent before the admins are asked to continue or end it; see section 4.
 - Order reminders: `ORDER_REMIND_AFTER_MIN` (default 15), `ORDER_REMIND_EVERY_MIN` (default 15) and `ORDER_REMIND_MAX` (default 3, `0` = off); see section 4.
 
 ## 4. How it works
@@ -54,10 +55,11 @@ Only after the customer confirms is the order created and sent to every admin as
 - While an order is `pending` the customer can withdraw it: `/buyurtmalarim` lists his latest orders with their status and a cancel button; the admins' cards are updated and they get a short notice.
 - `/admin` -> **Buyurtmalar** is a menu with the counts: **Kutilayotgan** (pending cards), **Jarayonda** (accepted, not yet finished cards), **Yakunlangan** (compact text list of the latest finished orders) and **Tozalash**.
 - **Tozalash** deletes finished orders (completed, cancelled, rejected) - all of them or only those older than 7 days - after a confirmation, together with their cards and relayed messages in the admins' chats. Pending and in-progress orders are never touched.
-- **Admin bilan bog'lanish:** the customer writes his question (text, voice, photo); every admin gets a card and each relayed message, and any admin answers by replying to it. The customer ends the chat with `/cancel`, an admin with **Suhbatni yakunlash**; an inquiry with no customer activity for 24 hours stops relaying. If the customer already has an open order chat, he simply writes there.
+- **Admin bilan bog'lanish:** the customer writes his question (text, voice, photo). Every admin gets a card with the customer, the product (name, price and id) and a **Qabul qilish** button. The first admin to tap it (or to reply to the card) owns the chat: the other cards become "taken", and from then on the customer's messages reach only that admin. The customer ends the chat with `/cancel`, an admin with **Suhbatni yakunlash**; an inquiry with no customer activity for 24 hours stops relaying. If the customer already has an open order chat, he simply writes there.
+- **Quiet inquiries:** if nobody writes in a claimed inquiry for `INQUIRY_IDLE_HOURS` hours (default 1), the chat is *not* closed. Every admin gets a card with **Davom ettirish** and **Suhbatni yakunlash**. The first admin to tap **Davom ettirish** takes the chat over and is sent the customer, the product with its id and the conversation so far (the last 50 messages); from then on the customer's messages reach him alone. If someone writes again before anyone decides, the cards are withdrawn. The check runs every 2 minutes (`inquiry_idle.py`). Order chats are unchanged: their messages still go to every admin.
 - **Reminders:** a pending order that nobody decided within `ORDER_REMIND_AFTER_MIN` minutes is repeated to every admin (as a reply to the order card), then again every `ORDER_REMIND_EVERY_MIN` minutes, at most `ORDER_REMIND_MAX` times. The check runs every 2 minutes and does not depend on the night window.
 
-Existing databases are upgraded automatically at startup (schema v6 adds the new order columns, v7 the inquiry tables); old orders show quantity 1 and no phone/address.
+Existing databases are upgraded automatically at startup (schema v6 adds the new order columns, v7 the inquiry tables, v8-v9 the inquiry claim columns and the card/transcript tables); old orders show quantity 1 and no phone/address.
 
 ## 5. Tests
 ```bash

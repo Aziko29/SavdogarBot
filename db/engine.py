@@ -23,6 +23,8 @@ from db.schema import (
     admins_t,
     chats_t,
     inquiries_t,
+    inquiry_history_t,
+    inquiry_notice_t,
     inquiry_relay_t,
     metadata,
     pending_chats_t,
@@ -140,6 +142,31 @@ def _create_inquiry_tables(conn: Connection) -> None:
     inquiry_relay_t.create(bind=conn, checkfirst=True)
 
 
+def _add_inquiry_claim_columns(conn: Connection) -> None:
+    """Add inquiries.claimed_by/idle_notice_sent for the single-admin claim feature (idempotent)."""
+    if conn.dialect.name == "postgresql":
+        conn.execute(text("ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS claimed_by BIGINT"))
+        conn.execute(
+            text("ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS idle_notice_sent BOOLEAN NOT NULL DEFAULT FALSE")
+        )
+        return
+    for ddl in (
+        "ALTER TABLE inquiries ADD COLUMN claimed_by BIGINT",
+        "ALTER TABLE inquiries ADD COLUMN idle_notice_sent BOOLEAN NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(text(ddl))
+        except OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
+def _create_inquiry_claim_tables(conn: Connection) -> None:
+    """Create inquiry_notice + inquiry_history (claim cards and conversation transcript) for older DBs."""
+    inquiry_notice_t.create(bind=conn, checkfirst=True)
+    inquiry_history_t.create(bind=conn, checkfirst=True)
+
+
 # Ordered (version, description, fn) entries; version 1 is the baseline created by create_all().
 # Migration fns must be idempotent (CREATE ... IF NOT EXISTS) because create_all() runs first.
 _MIGRATIONS: tuple[Migration, ...] = (
@@ -149,6 +176,8 @@ _MIGRATIONS: tuple[Migration, ...] = (
     (5, "add the pending_chats table: unregistered chats the bot leaves after a grace period", _create_pending_chats_table),
     (6, "add order details (quantity, phone, address), outcome and reminder columns to orders", _add_order_details),
     (7, "add the inquiries tables: customer <-> admin chat that is not tied to an order", _create_inquiry_tables),
+    (8, "add inquiries.claimed_by/idle_notice_sent for the single-admin inquiry claim feature", _add_inquiry_claim_columns),
+    (9, "add inquiry_notice + inquiry_history for the claim cards and conversation replay", _create_inquiry_claim_tables),
 )
 
 BASELINE_VERSION = 1
