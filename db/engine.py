@@ -22,6 +22,7 @@ from config import BASE_DIR, settings
 from db.schema import (
     admins_t,
     chats_t,
+    customers_t,
     inquiries_t,
     inquiry_history_t,
     inquiry_notice_t,
@@ -167,6 +168,11 @@ def _create_inquiry_claim_tables(conn: Connection) -> None:
     inquiry_history_t.create(bind=conn, checkfirst=True)
 
 
+def _create_customers_table(conn: Connection) -> None:
+    """Create the customers table (saved phone/address for repeat orders) for older DBs (idempotent)."""
+    customers_t.create(bind=conn, checkfirst=True)
+
+
 # Ordered (version, description, fn) entries; version 1 is the baseline created by create_all().
 # Migration fns must be idempotent (CREATE ... IF NOT EXISTS) because create_all() runs first.
 _MIGRATIONS: tuple[Migration, ...] = (
@@ -178,6 +184,7 @@ _MIGRATIONS: tuple[Migration, ...] = (
     (7, "add the inquiries tables: customer <-> admin chat that is not tied to an order", _create_inquiry_tables),
     (8, "add inquiries.claimed_by/idle_notice_sent for the single-admin inquiry claim feature", _add_inquiry_claim_columns),
     (9, "add inquiry_notice + inquiry_history for the claim cards and conversation replay", _create_inquiry_claim_tables),
+    (10, "add the customers table: saved phone/address so repeat orders take one tap", _create_customers_table),
 )
 
 BASELINE_VERSION = 1

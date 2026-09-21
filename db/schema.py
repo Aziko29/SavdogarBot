@@ -300,6 +300,17 @@ admins_t = Table(
     Column("created_at", UTCDateTime, nullable=False, default=_utcnow),
 )
 
+# What a customer typed in the order form last time (phone and delivery address), so the next order
+# can reuse it with one tap. One row per customer; he can delete it himself with /malumotlarim.
+customers_t = Table(
+    "customers",
+    metadata,
+    Column("user_id", BigInteger, primary_key=True, autoincrement=False),
+    Column("phone", Text, nullable=False, server_default=""),
+    Column("address", Text, nullable=False, server_default=""),
+    Column("updated_at", UTCDateTime, nullable=False, default=_utcnow, onupdate=_utcnow),
+)
+
 chats_t = Table(
     "chats",
     metadata,

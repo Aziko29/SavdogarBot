@@ -26,6 +26,8 @@ from aiogram.types import (
     ReplyParameters,
 )
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from config import settings
 from db.admins import admin_ids, is_admin
 from db.orders import (
@@ -57,6 +59,7 @@ from db.inquiries import (
     try_claim_inquiry,
     try_continue_inquiry,
 )
+from db.customers import delete_saved_details, get_saved_details, save_details
 from db.products import get_product
 from handlers.filters import AdminFilter, NotAdminFilter
 from poster import mark_sold
@@ -122,6 +125,7 @@ _ASK_NOTE_TEXT = (
 _DETAILS_SAVED_TEXT = "Ma'lumotlar qabul qilindi \u2705"
 _CONFIRM_BUTTON_TEXT = "\u2705 Tasdiqlash"
 _CANCEL_BUTTON_TEXT = "\u274c Bekor qilish"
+_USE_THE_BUTTONS_TEXT = "Iltimos, yuqoridagi tugmalardan birini bosing yoki bekor qilish uchun /cancel yozing."
 _USE_THE_FORM_TEXT = "Iltimos, so'ralgan ma'lumotni yuboring yoki bekor qilish uchun /cancel yozing."
 _CANCELLED_TEXT = "Bekor qilindi."
 _EXPIRED_TEXT = "Vaqt tugadi, iltimos mahsulot havolasini qaytadan bosing."
@@ -200,17 +204,34 @@ _INQUIRY_CONTINUE_READY_TEXT = (
 _INQUIRY_HISTORY_TRUNCATED_TEXT = "(faqat oxirgi {shown} ta xabar ko'rsatildi, jami {total} ta)"
 _INQUIRY_HISTORY_MAX = 50  # replayed messages per hand-over; older ones are summarised, not sent
 _TG_RETRY_CAP_SEC = 30.0  # longest flood-control wait we sit through inside a handler
+_SAVED_DETAILS_TEXT = (
+    "\U0001f4cb <b>Saqlangan ma'lumotlaringiz</b>\n\n"
+    "Telefon: {phone}\nManzil: {address}\n\n"
+    "Shu ma'lumotlar bilan davom etamizmi?"
+)
+_USE_SAVED_BUTTON_TEXT = "\u2705 Ha, shular"
+_EDIT_SAVED_BUTTON_TEXT = "\u270f\ufe0f O'zgartirish"
+_DETAILS_REMEMBERED_TEXT = (
+    "\U0001f4be Telefon va manzilingiz keyingi buyurtma uchun saqlandi (faqat o'zingiz ko'rasiz).\n"
+    "Ko'rish yoki o'chirish: /malumotlarim"
+)
+_MY_DATA_TEXT = "\U0001f4cb <b>Saqlangan ma'lumotlaringiz</b>\n\nTelefon: {phone}\nManzil: {address}"
+_NO_SAVED_DATA_TEXT = "Sizning saqlangan ma'lumotingiz yo'q. Ular birinchi buyurtmangizdan keyin saqlanadi."
+_DELETE_SAVED_BUTTON_TEXT = "\U0001f5d1 Ma'lumotlarimni o'chirish"
+_SAVED_DELETED_TEXT = "\U0001f5d1 Saqlangan ma'lumotlaringiz o'chirildi."
 _PLAIN_START_TEXT = (
     "Assalomu alaykum! Buyurtma berish yoki mahsulot haqida savol berish uchun "
     "kanaldagi mahsulot ostidagi havolani bosing.\n"
-    "Buyurtmalaringiz holati: /buyurtmalarim"
+    "Buyurtmalaringiz holati: /buyurtmalarim\n"
+    "Saqlangan telefon va manzilingiz: /malumotlarim"
 )
 
 
 class OrderFlow(StatesGroup):
-    """FSM of the order form: quantity -> phone -> address -> note -> confirmation."""
+    """FSM of the order form: quantity -> (saved details?) -> phone -> address -> note -> confirmation."""
 
     waiting_quantity = State()
+    waiting_saved = State()  # only when saved details exist: use them or retype
     waiting_phone = State()
     waiting_address = State()
     waiting_note = State()
@@ -221,6 +242,18 @@ class QuantityCB(CallbackData, prefix="oqty"):
     """Customer tapped a quantity button in the order form."""
 
     value: int
+
+
+class SavedDetailsCB(CallbackData, prefix="osav"):
+    """Customer's answer to "use your saved phone and address?" in the order form."""
+
+    action: str  # "use" | "edit"
+
+
+class MyDataCB(CallbackData, prefix="mydat"):
+    """Customer tapped 'delete' on his saved-details screen (/malumotlarim)."""
+
+    action: str  # "delete"
 
 
 class ConfirmCB(CallbackData, prefix="ocnf"):
@@ -789,6 +822,45 @@ async def cmd_my_orders(message: Message) -> None:
     await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
+@router.message(Command("malumotlarim"))
+async def cmd_my_data(message: Message) -> None:
+    """Show the customer the phone/address we saved for him, with a button to delete them."""
+    user = message.from_user
+    if user is None:
+        return
+    try:
+        saved = await get_saved_details(user.id)
+    except SQLAlchemyError:
+        await message.answer("Ma'lumotlar bazasi xatosi. Iltimos, keyinroq urinib ko'ring.")
+        return
+    if saved is None or not (saved.phone or saved.address):
+        await message.answer(_NO_SAVED_DATA_TEXT)
+        return
+    text = _MY_DATA_TEXT.format(
+        phone=html.escape(saved.phone) or "\u2014", address=html.escape(saved.address) or "\u2014"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=_DELETE_SAVED_BUTTON_TEXT, callback_data=MyDataCB(action="delete").pack())]]
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.callback_query(MyDataCB.filter(F.action == "delete"))
+async def on_my_data_delete(callback: CallbackQuery) -> None:
+    """The customer asked us to forget his saved phone/address."""
+    try:
+        await delete_saved_details(callback.from_user.id)
+    except SQLAlchemyError:
+        await _safe_answer(callback, "Ma'lumotlar bazasi xatosi. Iltimos, keyinroq urinib ko'ring.", show_alert=True)
+        return
+    await _safe_answer(callback, _SAVED_DELETED_TEXT)
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(_SAVED_DELETED_TEXT)
+        except TelegramBadRequest:
+            pass
+
+
 @router.callback_query(UserCancelCB.filter())
 async def on_user_cancel(callback: CallbackQuery, callback_data: UserCancelCB, bot: Bot) -> None:
     """The customer withdrew a pending order; admins' cards are updated and told."""
@@ -937,9 +1009,33 @@ def _normalize_phone(raw: str) -> str | None:
     return "+" + digits
 
 
+def _saved_markup() -> InlineKeyboardMarkup:
+    """'Use my saved details' / 'change them' buttons."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=_USE_SAVED_BUTTON_TEXT, callback_data=SavedDetailsCB(action="use").pack()),
+            InlineKeyboardButton(text=_EDIT_SAVED_BUTTON_TEXT, callback_data=SavedDetailsCB(action="edit").pack()),
+        ]]
+    )
+
+
 async def _accept_quantity(message: Message, state: FSMContext, quantity: int) -> None:
-    """Store the quantity and ask for the phone number."""
+    """Store the quantity, then offer the saved phone/address (repeat customer) or ask for the phone number.
+
+    `message` may be the bot's own prompt (when a quantity button was tapped), so the customer is
+    identified by the chat id, which in this private-chat-only router is his user id.
+    """
     await _touch(state, quantity=quantity)
+    try:
+        saved = await get_saved_details(message.chat.id)
+    except SQLAlchemyError:
+        saved = None  # the form must keep working without the shortcut
+    if saved is not None and saved.usable:
+        await _touch(state, saved_phone=saved.phone, saved_address=saved.address)
+        await state.set_state(OrderFlow.waiting_saved)
+        text = _SAVED_DETAILS_TEXT.format(phone=html.escape(saved.phone), address=html.escape(saved.address))
+        await message.answer(text, parse_mode="HTML", reply_markup=_saved_markup())
+        return
     await state.set_state(OrderFlow.waiting_phone)
     await message.answer(_ASK_PHONE_TEXT, reply_markup=_phone_markup())
 
@@ -1022,6 +1118,39 @@ async def on_quantity_text(message: Message, state: FSMContext) -> None:
         await message.answer(_BAD_QUANTITY_TEXT)
         return
     await _accept_quantity(message, state, int(raw))
+
+
+@router.callback_query(OrderFlow.waiting_saved, SavedDetailsCB.filter())
+async def on_saved_details(callback: CallbackQuery, callback_data: SavedDetailsCB, state: FSMContext) -> None:
+    """The customer answered "use the saved phone and address?": skip those two steps, or retype them."""
+    message = callback.message
+    if not isinstance(message, Message):
+        await _safe_answer(callback)
+        return
+    data = await _fresh_data(state)
+    if data is None:
+        await _safe_answer(callback, _EXPIRED_TEXT, show_alert=True)
+        return
+    await _safe_answer(callback)
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass  # the buttons are already gone
+
+    phone, address = str(data.get("saved_phone") or ""), str(data.get("saved_address") or "")
+    if callback_data.action == "use" and phone and address:
+        await _touch(state, phone=phone, address=address)
+        await state.set_state(OrderFlow.waiting_note)
+        await message.answer(_ASK_NOTE_TEXT, reply_markup=_note_markup())
+        return
+    await state.set_state(OrderFlow.waiting_phone)
+    await message.answer(_ASK_PHONE_TEXT, reply_markup=_phone_markup())
+
+
+@router.message(OrderFlow.waiting_saved)
+async def on_saved_details_text(message: Message) -> None:
+    """Typing instead of tapping at the saved-details question: point back at the buttons."""
+    await message.answer(_USE_THE_BUTTONS_TEXT)
 
 
 @router.message(OrderFlow.waiting_phone, F.contact)
@@ -1116,6 +1245,21 @@ async def on_note_photo(message: Message, state: FSMContext) -> None:
     await _show_summary(message, state)
 
 
+async def _remember_details(message: Message, user_id: int, phone: str, address: str) -> None:
+    """Keep the phone/address for the customer's next order; tell him once when something was stored.
+
+    Never raises: the order is already placed and the admins notified, so a storage problem only
+    means the customer retypes his details next time.
+    """
+    try:
+        # A "pick it up myself" order must not replace a saved delivery address.
+        changed = await save_details(user_id, phone, None if address == _PICKUP_ADDRESS else address)
+        if changed:
+            await message.answer(_DETAILS_REMEMBERED_TEXT)
+    except Exception:
+        logger.exception("Could not remember the order details of user %s", user_id)
+
+
 # One confirmation at a time per customer: two quick taps must not create two orders.
 _confirming: set[int] = set()
 
@@ -1176,11 +1320,14 @@ async def on_confirm(callback: CallbackQuery, callback_data: ConfirmCB, state: F
         await _notify_admins(bot, order_id)
         if media_msg_id:
             await _forward_media_to_admins(bot, message.chat.id, int(media_msg_id))
+        await _remember_details(message, user.id, str(data["phone"]), str(data["address"]))
     finally:
         _confirming.discard(user.id)
 
 
-@router.callback_query(F.data.startswith((QuantityCB.__prefix__ + ":", ConfirmCB.__prefix__ + ":")))
+@router.callback_query(
+    F.data.startswith((QuantityCB.__prefix__ + ":", ConfirmCB.__prefix__ + ":", SavedDetailsCB.__prefix__ + ":"))
+)
 async def on_stale_form_button(callback: CallbackQuery) -> None:
     """A form button pressed after its form ended (finished, cancelled or expired)."""
     await _safe_answer(callback, _STALE_BUTTON_TEXT, show_alert=True)
