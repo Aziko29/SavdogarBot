@@ -168,6 +168,20 @@ def _create_inquiry_claim_tables(conn: Connection) -> None:
     inquiry_history_t.create(bind=conn, checkfirst=True)
 
 
+def _add_inquiry_wait_column(conn: Connection) -> None:
+    """Add inquiries.wait_notice_sent for the customer's "admins are busy" note (idempotent)."""
+    if conn.dialect.name == "postgresql":
+        conn.execute(
+            text("ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS wait_notice_sent BOOLEAN NOT NULL DEFAULT FALSE")
+        )
+        return
+    try:
+        conn.execute(text("ALTER TABLE inquiries ADD COLUMN wait_notice_sent BOOLEAN NOT NULL DEFAULT 0"))
+    except OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 def _create_customers_table(conn: Connection) -> None:
     """Create the customers table (saved phone/address for repeat orders) for older DBs (idempotent)."""
     customers_t.create(bind=conn, checkfirst=True)
@@ -185,6 +199,7 @@ _MIGRATIONS: tuple[Migration, ...] = (
     (8, "add inquiries.claimed_by/idle_notice_sent for the single-admin inquiry claim feature", _add_inquiry_claim_columns),
     (9, "add inquiry_notice + inquiry_history for the claim cards and conversation replay", _create_inquiry_claim_tables),
     (10, "add the customers table: saved phone/address so repeat orders take one tap", _create_customers_table),
+    (11, "add inquiries.wait_notice_sent for the customer's \"admins are busy\" note", _add_inquiry_wait_column),
 )
 
 BASELINE_VERSION = 1

@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 
 from db.engine import dialect_insert, engine, logged_db
 from db.schema import inquiries_t, inquiry_history_t, inquiry_notice_t, inquiry_relay_t
@@ -62,6 +62,7 @@ async def open_inquiry(user_id: int, product_id: int | None, fullname: str) -> N
         "is_open": True,
         "claimed_by": None,
         "idle_notice_sent": False,
+        "wait_notice_sent": False,
         "updated_at": utcnow(),
     }
     stmt = dialect_insert(inquiries_t).values(user_id=user_id, **values)
@@ -241,6 +242,73 @@ async def mark_idle_notice_sent(user_id: int, older_than_hours: float | None = N
             update(inquiries_t).where(*conditions).values(idle_notice_sent=True, updated_at=inquiries_t.c.updated_at)
         )
     return result.rowcount == 1
+
+
+@logged_db
+async def list_unanswered_inquiries(older_than_minutes: float) -> list[Inquiry]:
+    """Open, unclaimed inquiries whose customer wrote his first message over `older_than_minutes` ago.
+
+    Only inquiries that have not had their "admins are busy" note yet are returned. The wait is
+    counted from the customer's first message, not from opening the chat: a customer who tapped
+    "contact the admin" but has not asked anything yet is not being kept waiting.
+    """
+    cutoff = utcnow() - timedelta(minutes=older_than_minutes)
+    first_message = (
+        select(func.min(inquiry_history_t.c.created_at))
+        .where(inquiry_history_t.c.user_id == inquiries_t.c.user_id, inquiry_history_t.c.sender == "customer")
+        .scalar_subquery()
+    )
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(inquiries_t).where(
+                    inquiries_t.c.is_open.is_(True),
+                    inquiries_t.c.claimed_by.is_(None),
+                    inquiries_t.c.wait_notice_sent.is_(False),
+                    first_message < cutoff,
+                )
+            )
+        ).all()
+    return [
+        Inquiry(int(r.user_id), int(r.product_id) if r.product_id is not None else None, r.user_fullname, None)
+        for r in rows
+    ]
+
+
+@logged_db
+async def mark_wait_notice_sent(user_id: int) -> bool:
+    """Atomically record that the customer's "admins are busy" note goes out now; True for the one caller that won.
+
+    Fails when the inquiry got claimed or closed in the meantime, so a chat that an admin just
+    accepted never gets a note saying nobody is there. `updated_at` is written back unchanged: the
+    note is not chat activity and must not restart the 24-hour expiry.
+    """
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            update(inquiries_t)
+            .where(
+                inquiries_t.c.user_id == user_id,
+                inquiries_t.c.is_open.is_(True),
+                inquiries_t.c.claimed_by.is_(None),
+                inquiries_t.c.wait_notice_sent.is_(False),
+            )
+            .values(wait_notice_sent=True, updated_at=inquiries_t.c.updated_at)
+        )
+    return result.rowcount == 1
+
+
+@logged_db
+async def customer_has_written(user_id: int) -> bool:
+    """True if the inquiry's transcript already holds a message from the customer."""
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                select(inquiry_history_t.c.id)
+                .where(inquiry_history_t.c.user_id == user_id, inquiry_history_t.c.sender == "customer")
+                .limit(1)
+            )
+        ).first()
+    return row is not None
 
 
 @logged_db

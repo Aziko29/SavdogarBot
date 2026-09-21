@@ -109,6 +109,7 @@ class Settings:
     order_remind_every_min: int = 15  # minimum gap between two reminders about the same order
     order_remind_max: int = 3  # reminders per order (0 = reminders off)
     inquiry_idle_hours: float = 1.0  # a claimed inquiry with no activity this long gets a "continue?" ping
+    inquiry_wait_min: int = 7  # an unclaimed inquiry this long gets a "admins are busy" note (0 = off)
 
 
 def _is_placeholder(value: str) -> bool:
@@ -292,6 +293,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     order_remind_every_min = r.integer("ORDER_REMIND_EVERY_MIN", 15, 1, 1440)
     order_remind_max = r.integer("ORDER_REMIND_MAX", 3, 0, 20)
     inquiry_idle_hours = r.number("INQUIRY_IDLE_HOURS", 1.0, 0.05, 24.0)
+    inquiry_wait_min = r.integer("INQUIRY_WAIT_MIN", 7, 0, 240)
     vision_hints = tuple(
         hint.lower() for hint in _split_csv(r.text("VISION_MODEL_HINTS", _DEFAULT_VISION_HINTS))
     )
@@ -326,6 +328,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         order_remind_every_min=order_remind_every_min,
         order_remind_max=order_remind_max,
         inquiry_idle_hours=inquiry_idle_hours,
+        inquiry_wait_min=inquiry_wait_min,
     )
 
 

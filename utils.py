@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Coroutine
 from datetime import datetime, timezone
+from datetime import time as dtime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,17 @@ _TZ = ZoneInfo(settings.tz)
 _bg_tasks: set[asyncio.Task[Any]] = set()
 _alert_last_sent: dict[str, float] = {}
 _MAX_ALERT_LEN = 4000
+
+
+def parse_hhmm(value: str) -> dtime:
+    """Parse a validated 'HH:MM' string (from db.settings) into a time object."""
+    hours, minutes = value.split(":")
+    return dtime(int(hours), int(minutes))
+
+
+def is_night(t: dtime, start: dtime, end: dtime) -> bool:
+    """True when `t` falls in the [start, end) window, handling windows that cross midnight."""
+    return (start <= t < end) if start <= end else (t >= start or t < end)
 
 
 def utcnow() -> datetime:

@@ -17,6 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from bot_commands import drop_admin_commands, ensure_admin_commands
 from config import settings
 from db.admins import add_admin, is_head_admin, list_admins, remove_admin
 from handlers.admin import ADMINS_CALLBACK, MenuCB, _db_guard, _edit
@@ -217,6 +218,7 @@ async def on_id_input(message: Message, state: FSMContext, bot: Bot) -> None:
         notice = f"\u2139\ufe0f {who} allaqachon admin."
     else:
         notice = f"\u2705 {who} admin qilib qo'shildi."
+        await ensure_admin_commands(bot, new_id)  # his "/" menu gets /admin (no-op until he has pressed Start)
         try:
             await bot.send_message(new_id, _NEW_ADMIN_TEXT)
         except TelegramForbiddenError:
@@ -272,6 +274,8 @@ async def on_delete(callback: CallbackQuery, callback_data: AdminActCB, state: F
     except ValueError:
         await callback.answer("Bosh adminni o'chirib bo'lmaydi.", show_alert=True)
         return
+    if removed:
+        await drop_admin_commands(bot, callback_data.user_id)  # back to the customer menu
     text, markup = await _render_list(bot)
     await _edit(callback, text, markup)
     await callback.answer("O'chirildi \u2705" if removed else "Allaqachon o'chirilgan.")

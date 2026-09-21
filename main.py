@@ -25,6 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import channel_listener
 from ai.providers import close_all_clients
 from ai.router import init_router, set_alert_hook
+from bot_commands import setup_bot_commands
 from chat_access import check_bot_access
 from config import settings
 from db.admins import load_admins
@@ -223,6 +224,7 @@ async def _startup(app: _App) -> None:
     except TelegramUnauthorizedError as exc:
         raise StartupError("Telegram rejected BOT_TOKEN (unauthorized).") from exc
     logger.info("Authorised as @%s (id=%s)", me.username, me.id)
+    await setup_bot_commands(app.bot)  # the "/" menu; never fatal
     await _report_chats(app.bot)
 
     scheduler = create_scheduler(app.bot)

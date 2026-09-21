@@ -28,6 +28,7 @@ from aiogram.types import (
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from bot_commands import ensure_admin_commands
 from config import settings
 from db.admins import admin_ids, is_admin
 from db.orders import (
@@ -47,6 +48,7 @@ from db.orders import (
 )
 from db.inquiries import (
     close_inquiry_if_open,
+    customer_has_written,
     find_inquiry_user_by_relay,
     get_inquiry_history,
     get_open_inquiry,
@@ -203,6 +205,8 @@ _INQUIRY_CONTINUE_READY_TEXT = (
 )
 _INQUIRY_HISTORY_TRUNCATED_TEXT = "(faqat oxirgi {shown} ta xabar ko'rsatildi, jami {total} ta)"
 _INQUIRY_HISTORY_MAX = 50  # replayed messages per hand-over; older ones are summarised, not sent
+_INQUIRY_SEEN_USER_TEXT = "\u2705 Admin savolingizni ko'rdi, tez orada javob yozadi."
+_INQUIRY_JOINED_USER_TEXT = "\u2705 Admin suhbatga qo'shildi. Savolingizni yozing."
 _TG_RETRY_CAP_SEC = 30.0  # longest flood-control wait we sit through inside a handler
 _SAVED_DETAILS_TEXT = (
     "\U0001f4cb <b>Saqlangan ma'lumotlaringiz</b>\n\n"
@@ -223,7 +227,27 @@ _PLAIN_START_TEXT = (
     "Assalomu alaykum! Buyurtma berish yoki mahsulot haqida savol berish uchun "
     "kanaldagi mahsulot ostidagi havolani bosing.\n"
     "Buyurtmalaringiz holati: /buyurtmalarim\n"
-    "Saqlangan telefon va manzilingiz: /malumotlarim"
+    "Saqlangan telefon va manzilingiz: /malumotlarim\n"
+    "Barcha buyruqlar: chap pastdagi «Menu» tugmasi yoki /yordam"
+)
+_HELP_TEXT = (
+    "\u2139\ufe0f <b>Yordam</b>\n\n"
+    "\U0001f6d2 <b>Buyurtma berish:</b> kanaldagi mahsulot ostidagi havolani bosing va "
+    "\u00abBuyurtma qilish\u00bb tugmasini tanlang. Bot sizdan ma'lumotlarni birma-bir so'raydi.\n"
+    "\U0001f4ac <b>Savol berish:</b> shu havola orqali \u00abAdmin bilan bog'lanish\u00bb tugmasini tanlang "
+    "\u2014 sotuvchi shu yerda javob beradi.\n\n"
+    "<b>Buyruqlar:</b>\n"
+    "/buyurtmalarim \u2014 buyurtmalaringiz holati (ko'rib chiqilmaganini bekor qilish mumkin)\n"
+    "/malumotlarim \u2014 saqlangan telefon va manzilingiz (o'chirish mumkin)\n"
+    "/cancel \u2014 buyurtma formasini yoki admin bilan suhbatni bekor qilish\n"
+    "/yordam \u2014 shu xabar"
+)
+_ADMIN_HELP_TEXT = (
+    "\u2139\ufe0f <b>Yordam (admin)</b>\n\n"
+    "/admin \u2014 admin paneli: buyurtmalar, mahsulotlar, suhbatlar\n"
+    "/cancel \u2014 boshlangan kiritishni (masalan, qiymat o'zgartirishni) bekor qilish\n"
+    "/yordam \u2014 shu xabar\n\n"
+    "Mijoz savoliga javob berish uchun uning xabariga reply qiling."
 )
 
 
@@ -770,11 +794,23 @@ async def on_product_ask(
 
 
 @router.message(CommandStart(deep_link=False))
-async def cmd_start_plain(message: Message) -> None:
+async def cmd_start_plain(message: Message, bot: Bot) -> None:
     """`/start` with no (or an unrecognized) deep-link payload: greet, no FSM entered."""
-    if message.from_user is not None and not _allow_start(message.from_user.id):
+    user = message.from_user
+    if user is not None and not _allow_start(user.id):
         return
+    if user is not None and is_admin(user.id):
+        # An admin who had never pressed Start had no chat to attach his menu to; now he has one.
+        await ensure_admin_commands(bot, user.id)
     await message.answer(_PLAIN_START_TEXT)
+
+
+@router.message(Command("yordam", "help"))
+async def cmd_help(message: Message) -> None:
+    """`/yordam`: what the bot does and every command; works in any state and never touches the form."""
+    user = message.from_user
+    text = _ADMIN_HELP_TEXT if user is not None and is_admin(user.id) else _HELP_TEXT
+    await message.answer(text, parse_mode="HTML")
 
 
 def _user_status_text(order: Order) -> str:
@@ -1548,6 +1584,24 @@ async def on_admin_chat_reply(message: Message, bot: Bot) -> None:
         pass  # A missing confirmation shouldn't matter; the reply already reached the customer.
 
 
+async def _tell_customer_claimed(bot: Bot, user_id: int) -> None:
+    """Let the customer know an admin took his inquiry (best effort; a failure here never affects the admin).
+
+    If he has not written anything yet the note asks for his question instead of claiming it was seen.
+    """
+    try:
+        written = await customer_has_written(user_id)
+    except SQLAlchemyError:
+        written = False
+    text = _INQUIRY_SEEN_USER_TEXT if written else _INQUIRY_JOINED_USER_TEXT
+    try:
+        await _tg_call(bot.send_message, user_id, text)
+    except TelegramForbiddenError:
+        logger.info("Inquiry of user %s: he has blocked the bot; acceptance note not delivered", user_id)
+    except Exception:
+        logger.exception("Inquiry of user %s: failed to send the acceptance note", user_id)
+
+
 @router.callback_query(InquiryClaimCB.filter(), AdminFilter())
 async def on_inquiry_claim(callback: CallbackQuery, callback_data: InquiryClaimCB, bot: Bot) -> None:
     """Admin tapped 'Qabul qilish' on the initial card: he alone now owns this inquiry."""
@@ -1572,6 +1626,8 @@ async def on_inquiry_claim(callback: CallbackQuery, callback_data: InquiryClaimC
         await _disable_other_notice_cards(
             bot, cards, admin.id, _INQUIRY_TAKEN_CARD_TEXT.format(name=admin.full_name)
         )
+        # Accepting by button says nothing to the customer by itself (a reply does, so that path stays silent).
+        await _tell_customer_claimed(bot, callback_data.user_id)
 
 
 @router.callback_query(InquiryContinueCB.filter(), AdminFilter())

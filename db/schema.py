@@ -214,7 +214,8 @@ chat_relay_t = Table(
 # "contact the admin" under a product). One row per customer; `is_open` + `updated_at` decide
 # whether his messages are still relayed. `claimed_by` is the one admin currently handling the
 # chat (NULL until someone accepts it); `idle_notice_sent` guards the 1-hour "still there?" ping
-# from firing more than once per idle spell.
+# from firing more than once per idle spell; `wait_notice_sent` does the same for the customer's
+# "admins are busy" note while nobody has accepted the chat (once per opened inquiry).
 inquiries_t = Table(
     "inquiries",
     metadata,
@@ -224,6 +225,7 @@ inquiries_t = Table(
     Column("is_open", Boolean, nullable=False, server_default=false()),
     Column("claimed_by", BigInteger, nullable=True),
     Column("idle_notice_sent", Boolean, nullable=False, server_default=false()),
+    Column("wait_notice_sent", Boolean, nullable=False, server_default=false()),
     Column("updated_at", UTCDateTime, nullable=False, default=_utcnow, onupdate=_utcnow),
 )
 

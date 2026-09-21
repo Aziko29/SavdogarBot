@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import random
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -14,11 +14,12 @@ from db.posts import recent_posted_product_ids
 from db.products import list_postable, recompute_categories
 from db.settings import get_settings
 from inquiry_idle import sweep_idle_inquiries
+from inquiry_wait import sweep_unanswered_inquiries
 from log_sender import send_logs_job
 from logging_setup import cleanup_old_logs
 from order_reminder import remind_pending_orders
 from poster import publish_product
-from utils import local_now, utcnow
+from utils import is_night, local_now, parse_hhmm, utcnow
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -38,17 +39,6 @@ _DOWNGRADE_MINUTE = 0
 _LOG_CLEANUP_HOURS = 24
 
 
-def _parse_hhmm(value: str) -> time:
-    """Parse a validated 'HH:MM' string (from db.settings) into a time object."""
-    hours, minutes = value.split(":")
-    return time(int(hours), int(minutes))
-
-
-def is_night(t: time, start: time, end: time) -> bool:
-    """True when `t` falls in the [start, end) window, handling windows that cross midnight."""
-    return (start <= t < end) if start <= end else (t >= start or t < end)
-
-
 def _eligible_for_repost(product: Product, now: datetime, gap: timedelta, recent_ids: set[int]) -> bool:
     """A product may be reposted unless it was posted very recently or is in the no-repeat window."""
     if product.id in recent_ids:
@@ -65,8 +55,8 @@ async def post_next(bot: Bot, force: bool = False) -> str:
     if not force:
         if not bot_settings.autopost_enabled:
             return "Avtomatik post o'chirilgan."
-        night_start = _parse_hhmm(bot_settings.night_start)
-        night_end = _parse_hhmm(bot_settings.night_end)
+        night_start = parse_hhmm(bot_settings.night_start)
+        night_end = parse_hhmm(bot_settings.night_end)
         if is_night(local_now().time(), night_start, night_end):
             return "Tungi vaqt — post qilinmadi."
 
@@ -121,6 +111,8 @@ _ORDER_REMIND_JOB_ID = "order_reminder"
 _ORDER_REMIND_CHECK_MIN = 2
 _INQUIRY_IDLE_JOB_ID = "inquiry_idle"
 _INQUIRY_IDLE_CHECK_MIN = 2
+_INQUIRY_WAIT_JOB_ID = "inquiry_wait"
+_INQUIRY_WAIT_CHECK_MIN = 1
 
 
 def create_scheduler(bot: Bot) -> AsyncIOScheduler:
@@ -190,6 +182,17 @@ def create_scheduler(bot: Bot) -> AsyncIOScheduler:
         coalesce=True,
         misfire_grace_time=300,
     )
+    if settings.inquiry_wait_min > 0:
+        scheduler.add_job(
+            sweep_unanswered_inquiries,
+            "interval",
+            minutes=_INQUIRY_WAIT_CHECK_MIN,
+            args=(bot,),
+            id=_INQUIRY_WAIT_JOB_ID,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+        )
     if settings.owner_id and settings.log_send_hours > 0:
         # First delivery shortly after start (so a crash/restart log reaches the owner), then every N hours.
         scheduler.add_job(
