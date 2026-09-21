@@ -1,8 +1,11 @@
 """Admin management (head admin only): list, add and remove regular admins from inside the bot."""
 from __future__ import annotations
 
+import asyncio
+import html
 import logging
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from aiogram import F, Router
@@ -59,24 +62,72 @@ def _back_row() -> list[InlineKeyboardButton]:
     return [_btn("\u2b05\ufe0f Orqaga", MenuCB(action="root").pack())]
 
 
-async def _render_list() -> tuple[str, InlineKeyboardMarkup]:
-    """Build the admins screen: head admin, regular admins, add and remove buttons."""
+_NAME_LOOKUP_TIMEOUT_SEC = 5.0
+_BUTTON_NAME_MAX = 18
+
+
+@dataclass(slots=True)
+class _Who:
+    """What Telegram tells us about one admin (all optional: he may never have started the bot)."""
+
+    user_id: int
+    name: str = ""
+    username: str = ""
+
+    @property
+    def short(self) -> str:
+        """A short label for buttons: the name, else @username, else the ID."""
+        label = self.name or (f"@{self.username}" if self.username else str(self.user_id))
+        return label if len(label) <= _BUTTON_NAME_MAX else label[: _BUTTON_NAME_MAX - 1] + "\u2026"
+
+    def line(self) -> str:
+        """HTML for the list: a clickable name, the @username and the ID (just the ID when the name is unknown)."""
+        if not self.name and not self.username:
+            return f"<code>{self.user_id}</code> (ismi noma'lum)"
+        label = html.escape(self.name or f"@{self.username}")
+        text = f'<a href="tg://user?id={self.user_id}">{label}</a>'
+        if self.name and self.username:
+            text += f" (@{html.escape(self.username)})"
+        return f"{text} \u00b7 <code>{self.user_id}</code>"
+
+
+async def _lookup(bot: Bot, user_id: int) -> _Who:
+    """Ask Telegram for one admin's name; never raises (a missing name just shows the ID)."""
+    try:
+        chat = await asyncio.wait_for(bot.get_chat(user_id), timeout=_NAME_LOOKUP_TIMEOUT_SEC)
+    except (TelegramAPIError, asyncio.TimeoutError):
+        logger.info("Could not look up the name of admin %s (he may not have started the bot)", user_id)
+        return _Who(user_id)
+    name = " ".join(part for part in (chat.first_name, chat.last_name) if part).strip()
+    return _Who(user_id, name, chat.username or "")
+
+
+async def _lookup_many(bot: Bot, user_ids: list[int]) -> dict[int, _Who]:
+    """Look up several admins at once (so a long list does not open slowly)."""
+    found = await asyncio.gather(*(_lookup(bot, uid) for uid in user_ids))
+    return {who.user_id: who for who in found}
+
+
+async def _render_list(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the admins screen: head admin, regular admins (with their names), add and remove buttons."""
     entries = await list_admins()
+    who = await _lookup_many(bot, [settings.head_admin_id, *(e.user_id for e in entries)])
     lines = [
         "\U0001f465 <b>Adminlar</b>",
         "",
-        f"\U0001f451 Bosh admin: <code>{settings.head_admin_id}</code>",
+        f"\U0001f451 Bosh admin: {who[settings.head_admin_id].line()}",
         "",
     ]
     if entries:
         lines.append(f"Adminlar ({len(entries)}):")
-        lines.extend(f"{i}. <code>{e.user_id}</code>" for i, e in enumerate(entries, start=1))
+        lines.extend(f"{i}. {who[e.user_id].line()}" for i, e in enumerate(entries, start=1))
     else:
         lines.append("Boshqa adminlar hali yo'q.")
 
     rows: list[list[InlineKeyboardButton]] = [[_btn("\u2795 Admin qo'shish", AdminActCB(action="add").pack())]]
     delete_buttons = [
-        _btn(f"\U0001f5d1 {e.user_id}", AdminActCB(action="ask_del", user_id=e.user_id).pack()) for e in entries
+        _btn(f"\U0001f5d1 {i}. {who[e.user_id].short}", AdminActCB(action="ask_del", user_id=e.user_id).pack())
+        for i, e in enumerate(entries, start=1)
     ]
     rows.extend(delete_buttons[i : i + 2] for i in range(0, len(delete_buttons), 2))
     rows.append(_back_row())
@@ -104,20 +155,20 @@ def _extract_user_id(message: Message) -> tuple[int | None, str | None]:
 
 @router.callback_query(F.data == ADMINS_CALLBACK)
 @_db_guard
-async def on_list(callback: CallbackQuery, state: FSMContext) -> None:
+async def on_list(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """Open the admins screen."""
     await state.clear()
-    text, markup = await _render_list()
+    text, markup = await _render_list(bot)
     await _edit(callback, text, markup)
     await callback.answer()
 
 
 @router.callback_query(AdminActCB.filter(F.action == "cancel"))
 @_db_guard
-async def on_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+async def on_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """Cancel adding or removing and return to the list."""
     await state.clear()
-    text, markup = await _render_list()
+    text, markup = await _render_list(bot)
     await _edit(callback, text, markup)
     await callback.answer("Bekor qilindi.")
 
@@ -138,10 +189,10 @@ async def on_add(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(Command("cancel"), StateFilter(AdminMgr))
 @_db_guard
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
+async def cmd_cancel(message: Message, state: FSMContext, bot: Bot) -> None:
     """Cancel the add-admin input."""
     await state.clear()
-    text, markup = await _render_list()
+    text, markup = await _render_list(bot)
     await message.answer("Bekor qilindi.")
     await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
@@ -161,10 +212,11 @@ async def on_id_input(message: Message, state: FSMContext, bot: Bot) -> None:
     added = await add_admin(new_id, added_by=settings.head_admin_id)
     await state.clear()
 
+    who = (await _lookup(bot, new_id)).line()
     if not added:
-        notice = f"\u2139\ufe0f <code>{new_id}</code> allaqachon admin."
+        notice = f"\u2139\ufe0f {who} allaqachon admin."
     else:
-        notice = f"\u2705 <code>{new_id}</code> admin qilib qo'shildi."
+        notice = f"\u2705 {who} admin qilib qo'shildi."
         try:
             await bot.send_message(new_id, _NEW_ADMIN_TEXT)
         except TelegramForbiddenError:
@@ -176,7 +228,7 @@ async def on_id_input(message: Message, state: FSMContext, bot: Bot) -> None:
             logger.warning("Could not notify the new admin %s: %s", new_id, exc)
             notice += "\n\u26a0\ufe0f Unga xabar yuborib bo'lmadi (ID to'g'ri ekanini tekshiring)."
     await message.answer(notice, parse_mode="HTML")
-    text, markup = await _render_list()
+    text, markup = await _render_list(bot)
     await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
@@ -190,7 +242,7 @@ async def on_id_not_text(message: Message) -> None:
 
 
 @router.callback_query(AdminActCB.filter(F.action == "ask_del"))
-async def on_ask_delete(callback: CallbackQuery, callback_data: AdminActCB) -> None:
+async def on_ask_delete(callback: CallbackQuery, callback_data: AdminActCB, bot: Bot) -> None:
     """Ask for confirmation before removing an admin."""
     target = callback_data.user_id
     if is_head_admin(target):
@@ -204,14 +256,15 @@ async def on_ask_delete(callback: CallbackQuery, callback_data: AdminActCB) -> N
             ]
         ]
     )
-    text = f"\U0001f5d1 <code>{target}</code> adminni o'chirasizmi?\nU admin panelga kira olmaydi va buyurtmalarni olmaydi."
+    who = (await _lookup(bot, target)).line()
+    text = f"\U0001f5d1 {who} adminni o'chirasizmi?\nU admin panelga kira olmaydi va buyurtmalarni olmaydi."
     await _edit(callback, text, markup)
     await callback.answer()
 
 
 @router.callback_query(AdminActCB.filter(F.action == "del"))
 @_db_guard
-async def on_delete(callback: CallbackQuery, callback_data: AdminActCB, state: FSMContext) -> None:
+async def on_delete(callback: CallbackQuery, callback_data: AdminActCB, state: FSMContext, bot: Bot) -> None:
     """Remove the admin and show the refreshed list."""
     await state.clear()
     try:
@@ -219,6 +272,6 @@ async def on_delete(callback: CallbackQuery, callback_data: AdminActCB, state: F
     except ValueError:
         await callback.answer("Bosh adminni o'chirib bo'lmaydi.", show_alert=True)
         return
-    text, markup = await _render_list()
+    text, markup = await _render_list(bot)
     await _edit(callback, text, markup)
     await callback.answer("O'chirildi \u2705" if removed else "Allaqachon o'chirilgan.")
