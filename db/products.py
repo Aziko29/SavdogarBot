@@ -276,6 +276,41 @@ def _filter_clause(flt: str) -> ColumnElement[bool] | None:
 
 
 @logged_db
+async def count_active_by_category() -> dict[str, int]:
+    """Return {category: active product count} for every category (0 for empty ones)."""
+    counts = {category: 0 for category in CATEGORIES}
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(products_t.c.category, func.count())
+            .where(products_t.c.status == "active")
+            .group_by(products_t.c.category)
+        )
+        for category, n in rows:
+            counts[category] = int(n)
+    return counts
+
+
+@logged_db
+async def list_catalog_products(category: str, offset: int, limit: int) -> tuple[list[Product], int]:
+    """Return one page of active products in a category (newest first) and the total count."""
+    _check_choice("category", category, CATEGORIES)
+    if offset < 0 or limit < 1:
+        raise ValueError("offset must be >= 0 and limit must be >= 1")
+    clause = and_(products_t.c.status == "active", products_t.c.category == category)
+    page = (
+        select(products_t)
+        .where(clause)
+        .order_by(products_t.c.created_at.desc(), products_t.c.id.desc())
+    )
+    count = select(func.count()).select_from(products_t).where(clause)
+    async with engine.connect() as conn:
+        total = int((await conn.execute(count)).scalar_one())
+        rows = await conn.execute(page.offset(offset).limit(limit))
+        items = [product_from_row(r) for r in rows]
+    return items, total
+
+
+@logged_db
 async def list_products(flt: str, offset: int, limit: int) -> tuple[list[Product], int]:
     """Return one page of products (newest first) and the total count for the filter."""
     clause = _filter_clause(flt)

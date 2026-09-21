@@ -62,7 +62,8 @@ from db.inquiries import (
     try_continue_inquiry,
 )
 from db.customers import delete_saved_details, get_saved_details, save_details
-from db.products import get_product
+from db.models import CATEGORIES
+from db.products import count_active_by_category, get_product, list_catalog_products
 from handlers.filters import AdminFilter, NotAdminFilter
 from poster import mark_sold
 
@@ -165,6 +166,13 @@ _USER_CANCELLED_ADMIN_TEXT = "\U0001f6ab Mijoz buyurtma #{order_id} ni bekor qil
 _STALE_BUTTON_TEXT = "Bu so'rov allaqachon yakunlangan yoki vaqti o'tgan."
 _ORDER_BUTTON_TEXT = "\U0001f6d2 Buyurtma qilish"
 _ASK_BUTTON_TEXT = "\U0001f4ac Admin bilan bog'lanish"
+_CATALOG_TITLE_TEXT = "\U0001f4c2 <b>Katalog</b>\n\nKategoriyani tanlang:"
+_CATALOG_EMPTY_TEXT = "Bu kategoriyada hozircha mahsulot yo'q."
+_CATALOG_MENU_BUTTON_TEXT = "\U0001f4c2 Kategoriyalar"
+_CATALOG_PREV_BUTTON_TEXT = "\u2b05\ufe0f Oldingi"
+_CATALOG_NEXT_BUTTON_TEXT = "Keyingi \u27a1\ufe0f"
+_CATALOG_POSITION_LINE = "\n\n\U0001f4c4 {index}/{total}"
+_CATEGORY_LABELS: dict[str, str] = {"new": "\U0001f195 Yangi", "mid": "\U0001f538 O'rta", "old": "\u231b Eski"}
 _INQUIRY_OPENED_TEXT = (
     "\U0001f4ac Savolingizni yozing (matn, ovozli xabar yoki rasm) \u2014 sotuvchiga yetkazaman va u shu yerda javob beradi.\n"
     "Suhbatni tugatish uchun /cancel yozing."
@@ -226,17 +234,21 @@ _SAVED_DELETED_TEXT = "\U0001f5d1 Saqlangan ma'lumotlaringiz o'chirildi."
 _PLAIN_START_TEXT = (
     "Assalomu alaykum! Buyurtma berish yoki mahsulot haqida savol berish uchun "
     "kanaldagi mahsulot ostidagi havolani bosing.\n"
+    "Mahsulotlarni ko'rish: /katalog\n"
     "Buyurtmalaringiz holati: /buyurtmalarim\n"
     "Saqlangan telefon va manzilingiz: /malumotlarim\n"
     "Barcha buyruqlar: chap pastdagi «Menu» tugmasi yoki /yordam"
 )
 _HELP_TEXT = (
     "\u2139\ufe0f <b>Yordam</b>\n\n"
-    "\U0001f6d2 <b>Buyurtma berish:</b> kanaldagi mahsulot ostidagi havolani bosing va "
-    "\u00abBuyurtma qilish\u00bb tugmasini tanlang. Bot sizdan ma'lumotlarni birma-bir so'raydi.\n"
-    "\U0001f4ac <b>Savol berish:</b> shu havola orqali \u00abAdmin bilan bog'lanish\u00bb tugmasini tanlang "
+    "\U0001f4c2 <b>Katalog:</b> /katalog orqali mahsulotlarni kategoriya bo'yicha ko'ring, "
+    "\u00abOldingi\u00bb / \u00abKeyingi\u00bb tugmalari bilan varaqlang.\n"
+    "\U0001f6d2 <b>Buyurtma berish:</b> mahsulot ostidagi \u00abBuyurtma qilish\u00bb tugmasini tanlang. "
+    "Bot sizdan ma'lumotlarni birma-bir so'raydi.\n"
+    "\U0001f4ac <b>Savol berish:</b> shu yerdagi \u00abAdmin bilan bog'lanish\u00bb tugmasini tanlang "
     "\u2014 sotuvchi shu yerda javob beradi.\n\n"
     "<b>Buyruqlar:</b>\n"
+    "/katalog \u2014 mahsulotlarni kategoriya bo'yicha ko'rish\n"
     "/buyurtmalarim \u2014 buyurtmalaringiz holati (ko'rib chiqilmaganini bekor qilish mumkin)\n"
     "/malumotlarim \u2014 saqlangan telefon va manzilingiz (o'chirish mumkin)\n"
     "/cancel \u2014 buyurtma formasini yoki admin bilan suhbatni bekor qilish\n"
@@ -291,6 +303,14 @@ class ProductActionCB(CallbackData, prefix="pact"):
 
     action: str  # "order" | "ask"
     product_id: int
+
+
+class CatalogCB(CallbackData, prefix="katalog"):
+    """Customer browsing /katalog: open the category menu, pick a category, or step next/prev."""
+
+    action: str  # "menu" | "cat" | "nav"
+    category: str = ""
+    index: int = 0
 
 
 class InquiryCloseCB(CallbackData, prefix="inqcl"):
@@ -523,6 +543,16 @@ async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_al
             raise
 
 
+async def _delete_quiet(message: Message) -> None:
+    """Delete a message, ignoring errors (already gone, too old, no rights, etc.)."""
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+    except Exception:
+        logger.exception("Failed to delete a catalog message")
+
+
 
 
 
@@ -544,6 +574,103 @@ def _product_actions_markup(product_id: int) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def _catalog_menu_markup(counts: dict[str, int]) -> InlineKeyboardMarkup:
+    """One button per category, each carrying its current active-product count."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{_CATEGORY_LABELS[category]} ({counts.get(category, 0)})",
+                callback_data=CatalogCB(action="cat", category=category).pack(),
+            )
+        ]
+        for category in CATEGORIES
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _catalog_product_markup(product_id: int, category: str, index: int, total: int) -> InlineKeyboardMarkup:
+    """Prev/next (whichever apply) on top, then order/ask, then back to the category menu."""
+    nav_row: list[InlineKeyboardButton] = []
+    if index > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text=_CATALOG_PREV_BUTTON_TEXT,
+                callback_data=CatalogCB(action="nav", category=category, index=index - 1).pack(),
+            )
+        )
+    if index < total - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text=_CATALOG_NEXT_BUTTON_TEXT,
+                callback_data=CatalogCB(action="nav", category=category, index=index + 1).pack(),
+            )
+        )
+    rows: list[list[InlineKeyboardButton]] = [nav_row] if nav_row else []
+    rows.append([
+        InlineKeyboardButton(
+            text=_ORDER_BUTTON_TEXT, callback_data=ProductActionCB(action="order", product_id=product_id).pack()
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            text=_ASK_BUTTON_TEXT, callback_data=ProductActionCB(action="ask", product_id=product_id).pack()
+        )
+    ])
+    rows.append([InlineKeyboardButton(text=_CATALOG_MENU_BUTTON_TEXT, callback_data=CatalogCB(action="menu").pack())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("katalog"))
+async def cmd_katalog(message: Message, state: FSMContext) -> None:
+    """`/katalog`: browse active products by category, one at a time, with next/prev buttons."""
+    await state.clear()  # leaves any half-filled order form behind; catalog browsing takes over
+    counts = await count_active_by_category()
+    await message.answer(_CATALOG_TITLE_TEXT, parse_mode="HTML", reply_markup=_catalog_menu_markup(counts))
+
+
+@router.callback_query(CatalogCB.filter(F.action == "menu"))
+async def on_catalog_menu(callback: CallbackQuery) -> None:
+    """Customer tapped 'Kategoriyalar': back to the category menu."""
+    message = callback.message
+    if not isinstance(message, Message):
+        await _safe_answer(callback)
+        return
+    counts = await count_active_by_category()
+    await _safe_answer(callback)
+    await message.answer(_CATALOG_TITLE_TEXT, parse_mode="HTML", reply_markup=_catalog_menu_markup(counts))
+    await _delete_quiet(message)
+
+
+@router.callback_query(CatalogCB.filter(F.action.in_({"cat", "nav"})))
+async def on_catalog_product(callback: CallbackQuery, callback_data: CatalogCB) -> None:
+    """Customer picked a category, or tapped 'Oldingi'/'Keyingi': show the product at that index."""
+    message = callback.message
+    if not isinstance(message, Message):
+        await _safe_answer(callback)
+        return
+    category = callback_data.category
+    if category not in CATEGORIES:
+        await _safe_answer(callback)
+        return
+
+    index = max(callback_data.index, 0)
+    items, total = await list_catalog_products(category, index, 1)
+    if not items:
+        await _safe_answer(callback, _CATALOG_EMPTY_TEXT, show_alert=True)
+        return
+
+    product = items[0]
+    caption = product.caption_html + _CATALOG_POSITION_LINE.format(index=index + 1, total=total)
+    await _safe_answer(callback)
+    await message.answer_photo(
+        product.tg_file_id,
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=_catalog_product_markup(product.id, category, index, total),
+    )
+    await _delete_quiet(message)
 
 
 @router.message(CommandStart(deep_link=True))

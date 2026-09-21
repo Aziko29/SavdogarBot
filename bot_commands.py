@@ -25,6 +25,7 @@ logger = logging.getLogger("bot_commands")
 
 # Telegram wants lower-case latin letters, digits and underscores; the descriptions are what the customer reads.
 CUSTOMER_COMMANDS: tuple[BotCommand, ...] = (
+    BotCommand(command="katalog", description="📂 Katalog"),
     BotCommand(command="buyurtmalarim", description="🧾 Buyurtmalarim"),
     BotCommand(command="malumotlarim", description="📋 Saqlangan ma'lumotlarim"),
     BotCommand(command="cancel", description="❌ Bekor qilish"),
