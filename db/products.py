@@ -218,6 +218,21 @@ async def recompute_categories(new_keep: int, mid_keep: int) -> None:
 
 
 @logged_db
+async def list_sources_to_check() -> list[tuple[int, int, int]]:
+    """Return (id, source_chat_id, source_msg_id) for every product not already marked removed.
+
+    Used by the periodic sweep that drops products whose source post was deleted upstream.
+    """
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(products_t.c.id, products_t.c.source_chat_id, products_t.c.source_msg_id)
+            .where(products_t.c.status != "removed")
+            .order_by(products_t.c.id)
+        )
+        return [(int(r[0]), int(r[1]), int(r[2])) for r in rows]
+
+
+@logged_db
 async def list_postable() -> list[Product]:
     """Return active products whose AI result is ready."""
     async with engine.connect() as conn:

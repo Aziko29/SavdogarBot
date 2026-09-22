@@ -19,6 +19,7 @@ from log_sender import send_logs_job
 from logging_setup import cleanup_old_logs
 from order_reminder import remind_pending_orders
 from poster import publish_product
+from source_sweep import sweep_deleted_source_posts
 from utils import is_night, local_now, parse_hhmm, utcnow
 
 if TYPE_CHECKING:
@@ -113,6 +114,8 @@ _INQUIRY_IDLE_JOB_ID = "inquiry_idle"
 _INQUIRY_IDLE_CHECK_MIN = 2
 _INQUIRY_WAIT_JOB_ID = "inquiry_wait"
 _INQUIRY_WAIT_CHECK_MIN = 1
+_SOURCE_SWEEP_JOB_ID = "source_sweep"
+_SOURCE_SWEEP_INTERVAL_HOURS = 3
 
 
 def create_scheduler(bot: Bot) -> AsyncIOScheduler:
@@ -193,6 +196,16 @@ def create_scheduler(bot: Bot) -> AsyncIOScheduler:
             coalesce=True,
             misfire_grace_time=300,
         )
+    scheduler.add_job(
+        sweep_deleted_source_posts,
+        "interval",
+        hours=_SOURCE_SWEEP_INTERVAL_HOURS,
+        args=(bot,),
+        id=_SOURCE_SWEEP_JOB_ID,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
     if settings.owner_id and settings.log_send_hours > 0:
         # First delivery shortly after start (so a crash/restart log reaches the owner), then every N hours.
         scheduler.add_job(
